@@ -1,0 +1,15 @@
+.agents/
+logs/
+
+# Visual Studio / local IDE state
+.vs/
+*.user
+*.suo
+
+# .NET build output
+bin/
+obj/
+
+# OS noise
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,207 @@
+using Scanner.Core;
+
+internal static class Program
+{
+    private static int Main()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "scanner-artifact-catalog-test-" + Guid.NewGuid().ToString("N"));
+
+        try
+        {
+            Directory.CreateDirectory(root);
+
+            string windows = Path.Combine(root, "Windows");
+            string programData = Path.Combine(root, "ProgramData");
+            string usersRoot = Path.Combine(root, "Users");
+            string profile = Path.Combine(usersRoot, "Alice");
+            string local = Path.Combine(profile, "AppData", "Local");
+            string roaming = Path.Combine(profile, "AppData", "Roaming");
+
+            Touch(Path.Combine(windows, "System32", "Config", "SYSTEM"));
+            Touch(Path.Combine(windows, "System32", "Config", "SOFTWARE.LOG1"));
+            Touch(Path.Combine(windows, "System32", "Config", "SYSTEM.regtrans-ms"));
+            Directory.CreateDirectory(Path.Combine(windows, "System32", "winevt", "Logs"));
+            Touch(Path.Combine(windows, "System32", "winevt", "Logs", "Application.evtx"));
+            Touch(Path.Combine(programData, "Microsoft", "Network", "Downloader", "qmgr0.dat"));
+            Directory.CreateDirectory(Path.Combine(programData, "Microsoft", "Windows Defender", "Scans", "History", "Service", "DetectionHistory"));
+            Directory.CreateDirectory(Path.Combine(local, "BraveSoftware", "Brave-Browser", "User Data"));
+            Directory.CreateDirectory(Path.Combine(local, "Packages", "TheBrowserCompany.Arc_abc", "LocalCache", "Local", "Arc", "User Data"));
+            Directory.CreateDirectory(Path.Combine(roaming, "zen", "Profiles"));
+            Directory.CreateDirectory(Path.Combine(roaming, "Microsoft", "Windows", "Recent"));
+            Directory.CreateDirectory(Path.Combine(roaming, "Microsoft", "Windows", "Recent", "AutomaticDestinations"));
+            Directory.CreateDirectory(Path.Combine(roaming, "Microsoft", "Windows", "Recent", "CustomDestinations"));
+            Touch(Path.Combine(profile, "NTUSER.DAT"));
+
+            var environment = new ArtifactCatalog.ArtifactCatalogEnvironment
+            {
+                Windows = windows,
+                SystemDrive = root,
+                UsersRoot = usersRoot,
+                ProgramData = programData,
+                ProgramFiles = Path.Combine(root, "Program Files"),
+                ProgramFilesX86 = Path.Combine(root, "Program Files (x86)"),
+                FixedDriveRoots = [root]
+            };
+
+            var roots = ArtifactCatalog.GetArtifactRoots(environment);
+
+            Assert(roots.Any(r => r.Name == "SystemHive-SYSTEM" && !r.CleanupEligible), "SYSTEM hive should be scan-only.");
+            Assert(roots.Any(r => r.Name == "SystemHive-SYSTEM-RegTrans" && !r.CleanupEligible), "Registry transaction sidecar should expand.");
+            Assert(roots.Any(r => r.Name == "BITS-Qmgr" && !r.CleanupEligible), "BITS qmgr wildcard should expand as scan-only.");
+            Assert(roots.Any(r => r.Name == "EventLogs" && !r.CleanupEligible), "Event log root should be scan-only.");
+            Assert(roots.Any(r => r.Name == "DefenderDetectionHistory" && !r.CleanupEligible), "Defender history should be scan-only.");
+            Assert(roots.Any(r => r.Name == "RecentFiles" && r.CleanupEligible), "Explorer Recent files should be cleanup-eligible.");
+            Assert(roots.Any(r => r.Name == "JumpLists-AutomaticDestinations" && r.CleanupEligible), "Explorer automatic Jump Lists should be cleanup-eligible.");
+            Assert(roots.Any(r => r.Name == "JumpLists-CustomDestinations" && r.CleanupEligible), "Explorer custom Jump Lists should be cleanup-eligible.");
+            Assert(roots.Any(r => r.Name == "BraveUserData" && r.CleanupEligible), "Brave profile should be cleanup-eligible.");
+            Assert(roots.Any(r => r.Name == "ArcUserData" && r.CleanupEligible), "Arc wildcard profile should expand.");
+            Assert(roots.GroupBy(r => (Path: Normalize(r.Path), r.IsFile)).All(g => g.Count() == 1), "Artifact roots should not contain duplicate paths.");
+
+            string cleanupCandidate = Path.Combine(root, "candidate.txt");
+            Touch(cleanupCandidate);
+            var findings = new[]
+            {
+                new ScanFinding { Kind = "FILE-NAME", Location = Path.Combine(root, "scan-only.txt"), CleanupEligible = false },
+                new ScanFinding { Kind = "FILE-NAME", Location = cleanupCandidate, CleanupEligible = true }
+            };
+            Assert(FindingCleanupService.CountTargets(findings) == 1, "Scan-only findings should not become cleanup targets.");
+
+            RunSmallFileScan(root).GetAwaiter().GetResult();
+            RunSmartContentGateScan(root).GetAwaiter().GetResult();
+            RunCleanupDeleteScan(root).GetAwaiter().GetResult();
+
+            Console.WriteLine("Scanner.Core catalog tests passed.");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            return 1;
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    private static void Touch(string path)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, "keyword");
+    }
+
+    private static string Normalize(string path)
+    {
+        try { return Path.GetFullPath(path).TrimEnd('\\', '/'); }
+        catch { return path.TrimEnd('\\', '/'); }
+    }
+
+    private static void Assert(bool condition, string message)
+    {
+        if (!condition)
+            throw new InvalidOperationException(message);
+    }
+
+    private static async Task RunSmallFileScan(string root)
+    {
+        string scanRoot = Path.Combine(root, "ScanRoot");
+        Touch(Path.Combine(scanRoot, "sample.txt"));
+
+        var matcher = KeywordMatcher.Build([PreparedKeyword.Prepare("keyword", 0)]);
+        var collector = new MatchCollector();
+        var scanner = new FileKeywordScanner(
+            matcher,
+            new(StringComparer.OrdinalIgnoreCase),
+            collector,
+            CancellationToken.None,
+            pruneMatchedDirectories: false,
+            excludedRoots: null,
+            enumWorkers: 1,
+            readWorkers: 1,
+            maxReadsPerVolume: 1,
+            parserWorkers: 1,
+            readBufferBytes: 64 * 1024);
+
+        await scanner.RunArtifactRootsAsync([new ArtifactRoot("TestRoot", scanRoot, isFile: false)], CancellationToken.None);
+        var results = collector.GetFindings();
+
+        Assert(results.Any(f => f.Location.EndsWith("sample.txt", StringComparison.OrdinalIgnoreCase)), "Small temp-root file scan should find sample.txt.");
+        Assert(results.All(f => f.CleanupEligible), "Default explicit scan roots should remain cleanup-eligible.");
+    }
+
+    private static async Task RunSmartContentGateScan(string root)
+    {
+        string scanRoot = Path.Combine(root, "SmartContentGate");
+        Directory.CreateDirectory(scanRoot);
+        string bulkFile = Path.Combine(scanRoot, "movie.mp4");
+        File.WriteAllText(bulkFile, "keyword");
+
+        var matcher = KeywordMatcher.Build([PreparedKeyword.Prepare("keyword", 0)]);
+        var smartCollector = new MatchCollector();
+        var smartScanner = new FileKeywordScanner(
+            matcher,
+            new(StringComparer.OrdinalIgnoreCase),
+            smartCollector,
+            CancellationToken.None,
+            pruneMatchedDirectories: false,
+            excludedRoots: null,
+            enumWorkers: 1,
+            readWorkers: 1,
+            maxReadsPerVolume: 1,
+            parserWorkers: 1,
+            readBufferBytes: 64 * 1024);
+
+        await smartScanner.RunArtifactRootsAsync([new ArtifactRoot("TestRoot", scanRoot, isFile: false)], CancellationToken.None);
+        Assert(!smartCollector.GetFindings().Any(f => f.Kind == "FILE-CONTENT" && f.Location.EndsWith("movie.mp4", StringComparison.OrdinalIgnoreCase)),
+            "Smart scan should skip raw content reads for bulk media extensions.");
+
+        var deepCollector = new MatchCollector();
+        var deepScanner = new FileKeywordScanner(
+            matcher,
+            new(StringComparer.OrdinalIgnoreCase),
+            deepCollector,
+            CancellationToken.None,
+            pruneMatchedDirectories: false,
+            excludedRoots: null,
+            enumWorkers: 1,
+            readWorkers: 1,
+            maxReadsPerVolume: 1,
+            parserWorkers: 1,
+            readBufferBytes: 64 * 1024,
+            deepContentScan: true);
+
+        await deepScanner.RunArtifactRootsAsync([new ArtifactRoot("TestRoot", scanRoot, isFile: false)], CancellationToken.None);
+        Assert(deepCollector.GetFindings().Any(f => f.Kind == "FILE-CONTENT" && f.Location.EndsWith("movie.mp4", StringComparison.OrdinalIgnoreCase)),
+            "Deep scan should still read raw content for bulk media extensions.");
+    }
+
+    private static async Task RunCleanupDeleteScan(string root)
+    {
+        string scanRoot = Path.Combine(root, "CleanupDelete");
+        Directory.CreateDirectory(scanRoot);
+        string file = Path.Combine(scanRoot, "surface-delete-keyword.txt");
+        File.WriteAllText(file, "plain content");
+
+        var service = new ScannerService();
+        var options = new ScanOptions
+        {
+            SkipElevation = true,
+            SkipRegistry = true
+        };
+        options.Keywords.Add("surface-delete-keyword");
+        options.Roots.Add(scanRoot);
+        options.DirectoryEnumWorkers = 1;
+        options.FileReadWorkers = 1;
+        options.ParserWorkers = 1;
+
+        var payload = await service.RunAsync(options);
+        Assert(payload.Findings.Any(f => f.Kind == "FILE-NAME" && f.Location.Equals(file, StringComparison.OrdinalIgnoreCase)),
+            "Cleanup delete scan should find keyword in a surface filename.");
+        Assert(FindingCleanupService.CountTargets(payload.Findings) == 1,
+            "Surface filename finding should become one cleanup target.");
+
+        var result = FindingCleanupService.DeleteFindings(payload.Findings);
+        Assert(result.DeletedCount == 1, "Surface filename cleanup target should delete successfully.");
+        Assert(!File.Exists(file), "Surface filename file should be gone after cleanup.");
+    }
+}

@@ -66,7 +66,8 @@ public sealed class ScannerService
                 parserWorkers: options.ParserWorkers,
                 readBufferBytes: options.ReadBufferBytes,
                 deepContentScan: options.DeepContentScan,
-                maxContentScanBytes: options.MaxContentScanBytes);
+                maxContentScanBytes: options.MaxContentScanBytes,
+                lowImpact: options.LowImpact);
             var unifiedRoots = BuildUnifiedFileRoots(roots, includeArtifactRoots: !hasExplicitRoots);
             int registryWorkers = NormalizeRegistryWorkers(options.RegistryWorkers);
 

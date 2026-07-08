@@ -68,6 +68,7 @@ internal static class Program
 
             RunSmallFileScan(root).GetAwaiter().GetResult();
             RunSmartContentGateScan(root).GetAwaiter().GetResult();
+            RunArchiveEntryScan(root).GetAwaiter().GetResult();
             RunCleanupDeleteScan(root).GetAwaiter().GetResult();
 
             Console.WriteLine("Scanner.Core catalog tests passed.");
@@ -173,6 +174,39 @@ internal static class Program
         await deepScanner.RunArtifactRootsAsync([new ArtifactRoot("TestRoot", scanRoot, isFile: false)], CancellationToken.None);
         Assert(deepCollector.GetFindings().Any(f => f.Kind == "FILE-CONTENT" && f.Location.EndsWith("movie.mp4", StringComparison.OrdinalIgnoreCase)),
             "Deep scan should still read raw content for bulk media extensions.");
+    }
+
+    private static async Task RunArchiveEntryScan(string root)
+    {
+        string scanRoot = Path.Combine(root, "ArchiveEntryScan");
+        Directory.CreateDirectory(scanRoot);
+        string archivePath = Path.Combine(scanRoot, "sample.zip");
+
+        using (var zip = System.IO.Compression.ZipFile.Open(archivePath, System.IO.Compression.ZipArchiveMode.Create))
+        {
+            var entry = zip.CreateEntry("nested/readme.txt");
+            using var writer = new StreamWriter(entry.Open());
+            writer.Write("inside-archive-keyword");
+        }
+
+        var service = new ScannerService();
+        var options = new ScanOptions
+        {
+            SkipElevation = true,
+            SkipRegistry = true
+        };
+        options.Keywords.Add("inside-archive-keyword");
+        options.Roots.Add(scanRoot);
+        options.DirectoryEnumWorkers = 1;
+        options.FileReadWorkers = 1;
+        options.ParserWorkers = 1;
+        options.ReadBufferBytes = 64 * 1024;
+
+        var payload = await service.RunAsync(options);
+        Assert(payload.Findings.Any(f => f.Kind == "FILE-ARCHIVE-ENTRY-CONTENT" && f.Location.Equals(archivePath, StringComparison.OrdinalIgnoreCase)),
+            "Smart scan should find keyword content inside ZIP-family archive entries.");
+        Assert(FindingCleanupService.CountTargets(payload.Findings) == 1,
+            "Archive entry findings should resolve to one cleanup target: the containing archive.");
     }
 
     private static async Task RunCleanupDeleteScan(string root)

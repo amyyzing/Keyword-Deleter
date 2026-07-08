@@ -18,6 +18,7 @@ public sealed class ScanOptions
     public int? ReadBufferBytes { get; set; }
     public bool DeepContentScan { get; set; }
     public long? MaxContentScanBytes { get; set; }
+    public bool LowImpact { get; set; }
     public bool SkipRegistry { get; set; }
     public bool FullRegistryScan { get; set; }
     public bool SkipSelfCheck { get; set; }

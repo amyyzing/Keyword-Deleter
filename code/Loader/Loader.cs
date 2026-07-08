@@ -132,6 +132,10 @@ internal static class Loader
             {
                 options.DeepContentScan = true;
             }
+            else if (arg.Equals("--low-impact", StringComparison.OrdinalIgnoreCase))
+            {
+                options.LowImpact = true;
+            }
             else if (arg.Equals("--max-content-mb", StringComparison.OrdinalIgnoreCase))
             {
                 int megabytes = ReadPositiveInt(args, ref i, arg);
@@ -347,6 +351,7 @@ internal static class Loader
         Console.WriteLine("  --buffer-mb <count>         Override per-reader buffer size in MiB.");
         Console.WriteLine("  --max-content-mb <count>    Smart-mode max raw content bytes per file in MiB. Default: 256.");
         Console.WriteLine("  --deep-content-scan         Read raw content from every file like the older scanner path.");
+        Console.WriteLine("  --low-impact                Use fewer workers and smaller buffers for weaker PCs or multitasking.");
         Console.WriteLine("  --help                      Show this help.");
         Console.WriteLine();
         Console.WriteLine("Running without arguments starts an interactive command-prompt flow.");

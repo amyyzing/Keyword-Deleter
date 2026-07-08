@@ -203,7 +203,13 @@ internal static class ForensicParserEngine
         catch { return Array.Empty<byte>(); }
     }
 
-    private static bool IsZipLike(string ext) => ext is ".zip" or ".docx" or ".xlsx" or ".pptx" or ".jar" or ".nupkg" or ".vsix";
+    public static bool IsZipLikePath(string path)
+    {
+        try { return IsZipLike(Path.GetExtension(path).ToLowerInvariant()); }
+        catch { return false; }
+    }
+
+    private static bool IsZipLike(string ext) => ext is ".zip" or ".docx" or ".xlsx" or ".pptx" or ".jar" or ".nupkg" or ".vsix" or ".odt" or ".ods" or ".odp";
 
     private static bool LooksLikePe(ReadOnlySpan<byte> b)
     {

@@ -15,6 +15,7 @@ internal sealed class FileKeywordScanner
     private readonly int _readBufferBytes;
     private readonly bool _deepContentScan;
     private readonly long _maxContentScanBytes;
+    private readonly bool _lowImpact;
     private Channel<DirJob> _dirChannel = null!;
     private Channel<FileJob> _fileChannel = null!;
     private Channel<ParseJob> _parseChannel = null!;
@@ -30,6 +31,7 @@ internal sealed class FileKeywordScanner
     private const int ParseQueuePerWorker = 16;
     private const int ParserPrefixBytes = 8 * 1024 * 1024;
     private const long DefaultMaxContentScanBytes = 256L * 1024 * 1024;
+    private const int MaxArchiveEntries = 300;
 
     private static readonly HashSet<string> SmartSkipRawContentExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -54,7 +56,8 @@ internal sealed class FileKeywordScanner
         int? parserWorkers = null,
         int? readBufferBytes = null,
         bool deepContentScan = false,
-        long? maxContentScanBytes = null)
+        long? maxContentScanBytes = null,
+        bool lowImpact = false)
     {
         _matcher = matcher;
         _seenFiles = seenFiles;
@@ -62,11 +65,12 @@ internal sealed class FileKeywordScanner
         _matchToken = matchToken;
         _pruneMatchedDirectories = pruneMatchedDirectories;
         _excludedRoots = NormalizeExcludedRoots(excludedRoots);
-        _enumWorkers = NormalizeCount(enumWorkers, DefaultEnumWorkers, 1, 64);
-        _readWorkers = NormalizeCount(readWorkers, DefaultReadWorkers, 1, 128);
-        _maxReadsPerVolume = NormalizeCount(maxReadsPerVolume, DefaultMaxReadsPerVolume, 1, 64);
-        _parserWorkers = NormalizeCount(parserWorkers, Math.Max(1, Environment.ProcessorCount / 2), 1, 64);
-        _readBufferBytes = NormalizeCount(readBufferBytes, DefaultReadBufferBytes, 64 * 1024, 64 * 1024 * 1024);
+        _lowImpact = lowImpact;
+        _enumWorkers = NormalizeCount(enumWorkers, lowImpact ? 2 : DefaultEnumWorkers, 1, lowImpact ? 4 : 64);
+        _readWorkers = NormalizeCount(readWorkers, lowImpact ? Math.Max(1, Math.Min(4, Environment.ProcessorCount / 2)) : DefaultReadWorkers, 1, lowImpact ? 8 : 128);
+        _maxReadsPerVolume = NormalizeCount(maxReadsPerVolume, lowImpact ? 2 : DefaultMaxReadsPerVolume, 1, lowImpact ? 4 : 64);
+        _parserWorkers = NormalizeCount(parserWorkers, lowImpact ? Math.Max(1, Math.Min(2, Environment.ProcessorCount / 2)) : Math.Max(1, Environment.ProcessorCount / 2), 1, lowImpact ? 4 : 64);
+        _readBufferBytes = NormalizeCount(readBufferBytes, lowImpact ? 512 * 1024 : DefaultReadBufferBytes, 64 * 1024, lowImpact ? 1024 * 1024 : 64 * 1024 * 1024);
         _deepContentScan = deepContentScan;
         _maxContentScanBytes = NormalizeLong(maxContentScanBytes, DefaultMaxContentScanBytes, 1024 * 1024, 16L * 1024 * 1024 * 1024);
     }
@@ -259,8 +263,9 @@ internal sealed class FileKeywordScanner
         catch { }
 
         bool parserCandidateByPath = ForensicParserEngine.MightParseByPath(path, info);
+        bool archiveCandidate = ForensicParserEngine.IsZipLikePath(path);
         bool rawContentAllowed = ShouldScanRawContent(path, info, fileSize);
-        if (!rawContentAllowed && !parserCandidateByPath)
+        if (!rawContentAllowed && !parserCandidateByPath && !archiveCandidate)
             return;
 
         byte[]? prefixBuffer = null;
@@ -292,6 +297,7 @@ internal sealed class FileKeywordScanner
                         bool needRawContentScan = rawContentAllowed && _matcher.HasBytePatterns && remainingContentKeywords > 0 && rawBytesRemaining > 0;
                         bool needParserProbe = !parserCandidateKnown && rawContentAllowed;
                         bool needParserPrefix = parserCandidate && prefixLength < prefixTarget;
+                        int chunksRead = 0;
 
                         while (!ct.IsCancellationRequested && (needRawContentScan || needParserProbe || needParserPrefix))
                         {
@@ -344,6 +350,10 @@ internal sealed class FileKeywordScanner
                             }
 
                             fileOffset += read;
+                            chunksRead++;
+
+                            if (_lowImpact && (chunksRead & 15) == 0)
+                                await Task.Delay(1, ct).ConfigureAwait(false);
 
                             needRawContentScan = rawContentAllowed && _matcher.HasBytePatterns && remainingContentKeywords > 0 && rawBytesRemaining > 0;
                             needParserProbe = !parserCandidateKnown;
@@ -362,12 +372,159 @@ internal sealed class FileKeywordScanner
                 prefixBuffer = null;
                 prefixLength = 0;
             }
+
+            if (!ct.IsCancellationRequested && archiveCandidate && File.Exists(path))
+                await ScanArchiveEntriesAsync(job, buffer, ct).ConfigureAwait(false);
         }
         finally
         {
             if (prefixBuffer != null)
                 ArrayPool<byte>.Shared.Return(prefixBuffer);
         }
+    }
+
+    private async Task ScanArchiveEntriesAsync(FileJob job, byte[] buffer, CancellationToken ct)
+    {
+        try
+        {
+            using var fs = PrivilegedFile.OpenRead(job.Path, _readBufferBytes, PrivilegeHelper.IsBackupPrivilegeEnabled);
+            using var archive = new System.IO.Compression.ZipArchive(fs, System.IO.Compression.ZipArchiveMode.Read, leaveOpen: false);
+
+            int listed = 0;
+            var entryHits = new bool[_matcher.Keywords.Length];
+            foreach (var entry in archive.Entries)
+            {
+                if (ct.IsCancellationRequested)
+                    return;
+
+                listed++;
+                if (listed > MaxArchiveEntries)
+                    break;
+
+                CheckArchiveEntryName(job.Source, job.Path, entry.FullName, job.CleanupEligible);
+
+                if (entry.Length <= 0 || entry.FullName.EndsWith("/", StringComparison.Ordinal))
+                    continue;
+
+                if (!_deepContentScan && entry.Length > _maxContentScanBytes)
+                    continue;
+
+                Array.Clear(entryHits, 0, entryHits.Length);
+                await ScanArchiveEntryContentAsync(job, entry, buffer, entryHits, ct).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex) when (ex is InvalidDataException or UnauthorizedAccessException or IOException or NotSupportedException or System.Security.SecurityException)
+        {
+            ScannerDiagnostics.Error($"Archive scan error on {job.Path}: {ex.Message}");
+        }
+    }
+
+    private async Task ScanArchiveEntryContentAsync(
+        FileJob job,
+        System.IO.Compression.ZipArchiveEntry entry,
+        byte[] buffer,
+        bool[] entryHits,
+        CancellationToken ct)
+    {
+        if (!_matcher.HasBytePatterns)
+            return;
+
+        try
+        {
+            await using var stream = entry.Open();
+            int byteMatcherState = 0;
+            int remainingContentKeywords = _matcher.ByteSearchableKeywordCount;
+            long offset = 0;
+            long bytesRemaining = _deepContentScan ? long.MaxValue : _maxContentScanBytes;
+            int chunksRead = 0;
+
+            while (!ct.IsCancellationRequested && remainingContentKeywords > 0 && bytesRemaining > 0)
+            {
+                int requested = (int)Math.Min(buffer.Length, bytesRemaining);
+                int read = await stream.ReadAsync(buffer.AsMemory(0, requested), ct).ConfigureAwait(false);
+                if (read == 0)
+                    break;
+
+                long chunkOffset = offset;
+                _matcher.SearchBytesUnique(
+                    buffer.AsMemory(0, read),
+                    ref byteMatcherState,
+                    entryHits,
+                    ref remainingContentKeywords,
+                    hit =>
+                    {
+                        string uniqueKey = $"{job.Source}|FILE-ARCHIVE-ENTRY-CONTENT|{hit.Keyword.Text}|{job.Path}|{entry.FullName}";
+                        _matches.HandleMatch(
+                            job.Source,
+                            "FILE-ARCHIVE-ENTRY-CONTENT",
+                            hit.Keyword.Text,
+                            job.Path,
+                            evidenceFactory: () => ArchiveEvidence(entry.FullName, EvidenceFormatter.Binary(buffer, read, hit, chunkOffset)),
+                            uniqueKey: uniqueKey,
+                            cleanupEligible: job.CleanupEligible);
+                        return !ct.IsCancellationRequested;
+                    });
+
+                offset += read;
+                bytesRemaining -= read;
+                chunksRead++;
+
+                if (_lowImpact && (chunksRead & 15) == 0)
+                    await Task.Delay(1, ct).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex) when (ex is InvalidDataException or UnauthorizedAccessException or IOException or NotSupportedException)
+        {
+            ScannerDiagnostics.Error($"Archive entry scan error on {job.Path}!{entry.FullName}: {ex.Message}");
+        }
+    }
+
+    private bool CheckArchiveEntryName(string source, string location, string entryName, bool cleanupEligible)
+    {
+        if (string.IsNullOrEmpty(entryName) || _matchToken.IsCancellationRequested)
+            return false;
+
+        bool matched = false;
+        int firstKeyword = -1;
+        HashSet<int>? moreKeywords = null;
+
+        foreach (var hit in _matcher.SearchDecodedText(entryName))
+        {
+            int idx = hit.Keyword.Index;
+
+            if (idx == firstKeyword)
+                continue;
+
+            if (firstKeyword < 0)
+            {
+                firstKeyword = idx;
+            }
+            else
+            {
+                moreKeywords ??= new HashSet<int> { firstKeyword };
+                if (!moreKeywords.Add(idx))
+                    continue;
+            }
+
+            matched = true;
+            string uniqueKey = $"{source}|FILE-ARCHIVE-ENTRY-NAME|{hit.Keyword.Text}|{location}|{entryName}";
+            _matches.HandleMatch(
+                source,
+                "FILE-ARCHIVE-ENTRY-NAME",
+                hit.Keyword.Text,
+                location,
+                evidenceFactory: () => ArchiveEvidence(entryName, EvidenceFormatter.Text(entryName, hit.Index, hit.MatchLength)),
+                uniqueKey: uniqueKey,
+                cleanupEligible: cleanupEligible);
+        }
+
+        return matched;
+    }
+
+    private static string ArchiveEvidence(string entryName, string innerEvidence)
+    {
+        string safeEntry = entryName.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal);
+        return $"entry=\"{safeEntry}\"; {innerEvidence}";
     }
 
     private void EmitParsedArtifact(string source, string path, ParsedArtifact parsed, bool cleanupEligible, CancellationToken ct)

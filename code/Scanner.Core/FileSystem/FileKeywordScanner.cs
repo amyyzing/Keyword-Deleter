@@ -26,11 +26,12 @@ internal sealed class FileKeywordScanner
     private const int DefaultEnumWorkers = 4;
     private const int DefaultReadWorkers = 16;
     private const int DefaultMaxReadsPerVolume = 8;
-    private const int DefaultReadBufferBytes = 4 * 1024 * 1024;
+    private const int DefaultReadBufferBytes = 1024 * 1024;
     private const int DirQueuePerEnumWorker = 512;
     private const int FileQueuePerReader = 1024;
     private const int ParseQueuePerWorker = 2;
     private const int ParserPrefixBytes = 8 * 1024 * 1024;
+    private const int EnumerationBufferBytes = 32 * 1024;
     private const long DefaultMaxContentScanBytes = 256L * 1024 * 1024;
     private const int MaxArchiveEntries = 300;
 
@@ -176,7 +177,8 @@ internal sealed class FileKeywordScanner
         {
             IgnoreInaccessible = true,
             RecurseSubdirectories = false,
-            AttributesToSkip = FileAttributes.ReparsePoint
+            AttributesToSkip = FileAttributes.ReparsePoint,
+            BufferSize = EnumerationBufferBytes
         };
 
         while (inlineJobs.TryPop(out var job))
@@ -206,17 +208,22 @@ internal sealed class FileKeywordScanner
 
             try
             {
-                foreach (var fsi in new DirectoryInfo(job.Path).EnumerateFileSystemInfos("*", options))
+                var entries = new System.IO.Enumeration.FileSystemEnumerable<EnumeratedEntry>(
+                    job.Path,
+                    CreateEnumeratedEntry,
+                    options);
+
+                foreach (var entry in entries)
                 {
                     if (ct.IsCancellationRequested)
                         return;
 
-                    string path = fsi.FullName;
+                    string path = entry.Path;
                     if (IsExcluded(path))
                         continue;
 
                     string source = ClassifyOrSource(job.Source, path);
-                    if ((fsi.Attributes & FileAttributes.Directory) != 0)
+                    if (entry.IsDirectory)
                     {
                         var childJob = new DirJob(path, job.Root, source, job.CleanupEligible);
                         if (!TryQueueDir(childJob))
@@ -224,16 +231,8 @@ internal sealed class FileKeywordScanner
                     }
                     else
                     {
-                        long length = -1;
-                        try
-                        {
-                            if (fsi is FileInfo fileInfo)
-                                length = Math.Max(0, fileInfo.Length);
-                        }
-                        catch { }
-
                         await _fileChannel.Writer.WriteAsync(
-                            new FileJob(path, job.Root, source, job.CleanupEligible, length),
+                            new FileJob(path, job.Root, source, job.CleanupEligible, entry.Length),
                             ct).ConfigureAwait(false);
                     }
                 }
@@ -259,7 +258,8 @@ internal sealed class FileKeywordScanner
 
     private async Task ReadWorker(CancellationToken ct)
     {
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(_readBufferBytes);
+        byte[] firstBuffer = ArrayPool<byte>.Shared.Rent(_readBufferBytes);
+        byte[] secondBuffer = ArrayPool<byte>.Shared.Rent(_readBufferBytes);
         var contentHits = new KeywordHitTracker(_matcher.Keywords.Length);
 
         try
@@ -270,7 +270,7 @@ internal sealed class FileKeywordScanner
 
                 contentHits.Reset();
 
-                try { await ProcessFileAsync(job, ct, buffer, contentHits).ConfigureAwait(false); }
+                try { await ProcessFileAsync(job, ct, firstBuffer, secondBuffer, contentHits).ConfigureAwait(false); }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
                 catch (Exception ex) { ScannerDiagnostics.Error($"Read error on {job.Path}: {ex.Message}"); }
             }
@@ -278,7 +278,8 @@ internal sealed class FileKeywordScanner
         catch (OperationCanceledException) { }
         finally
         {
-            ArrayPool<byte>.Shared.Return(buffer);
+            ArrayPool<byte>.Shared.Return(firstBuffer);
+            ArrayPool<byte>.Shared.Return(secondBuffer);
         }
     }
 
@@ -310,7 +311,12 @@ internal sealed class FileKeywordScanner
         catch (OperationCanceledException) { }
     }
 
-    private async Task ProcessFileAsync(FileJob job, CancellationToken ct, byte[] buffer, KeywordHitTracker contentHitsForFile)
+    private async Task ProcessFileAsync(
+        FileJob job,
+        CancellationToken ct,
+        byte[] firstBuffer,
+        byte[] secondBuffer,
+        KeywordHitTracker contentHitsForFile)
     {
         if (IsExcluded(job.Path)) return;
         if (!_seenFiles.TryAdd(job.Path, 0)) return;
@@ -339,7 +345,7 @@ internal sealed class FileKeywordScanner
         bool archiveCandidate = ForensicParserEngine.IsZipLikePath(path);
         if (archiveCandidate)
         {
-            await ScanArchiveEntriesAsync(job, buffer, contentHitsForFile, ct).ConfigureAwait(false);
+            await ScanArchiveEntriesAsync(job, firstBuffer, contentHitsForFile, ct).ConfigureAwait(false);
             return;
         }
 
@@ -361,33 +367,82 @@ internal sealed class FileKeywordScanner
                 try
                 {
                     int bufferSize = _readBufferBytes;
-                    using var fs = PrivilegedFile.OpenRead(path, bufferSize, PrivilegeHelper.IsBackupPrivilegeEnabled);
+                    using var handle = PrivilegedFile.OpenHandle(path, PrivilegeHelper.IsBackupPrivilegeEnabled);
 
-                        int remainingContentKeywords = _matcher.ByteSearchableKeywordCount;
-                        int byteMatcherState = 0;
-                        long fileOffset = 0;
-                        long rawBytesRemaining = rawContentAllowed
-                            ? (_deepContentScan ? long.MaxValue : Math.Min(_maxContentScanBytes, fileSize > 0 ? fileSize : _maxContentScanBytes))
-                            : 0;
+                    int remainingContentKeywords = _matcher.ByteSearchableKeywordCount;
+                    int byteMatcherState = 0;
+                    long fileOffset = 0;
+                    long rawBytesRemaining = rawContentAllowed
+                        ? (_deepContentScan ? long.MaxValue : Math.Min(_maxContentScanBytes, fileSize > 0 ? fileSize : _maxContentScanBytes))
+                        : 0;
 
-                        bool parserCandidateKnown = parserCandidateByPath;
-                        bool parserCandidate = parserCandidateByPath;
-                        long prefixTarget = parserCandidate
-                            ? Math.Min(ParserPrefixBytes, fileSize > 0 ? fileSize : ParserPrefixBytes)
-                            : 0;
-                        bool needRawContentScan = rawContentAllowed && _matcher.HasBytePatterns && remainingContentKeywords > 0 && rawBytesRemaining > 0;
-                        bool needParserProbe = !parserCandidateKnown && rawContentAllowed;
-                        bool needParserPrefix = parserCandidate && prefixLength < prefixTarget;
-                        int chunksRead = 0;
+                    bool parserCandidateKnown = parserCandidateByPath;
+                    bool parserCandidate = parserCandidateByPath;
+                    long prefixTarget = parserCandidate
+                        ? Math.Min(ParserPrefixBytes, fileSize > 0 ? fileSize : ParserPrefixBytes)
+                        : 0;
+                    bool needRawContentScan = rawContentAllowed && _matcher.HasBytePatterns && remainingContentKeywords > 0 && rawBytesRemaining > 0;
+                    bool needParserProbe = !parserCandidateKnown && rawContentAllowed;
+                    bool needParserPrefix = parserCandidate && prefixLength < prefixTarget;
+                    int chunksRead = 0;
 
-                        while (!ct.IsCancellationRequested && (needRawContentScan || needParserProbe || needParserPrefix))
+                    byte[] currentBuffer = firstBuffer;
+                    byte[] nextBuffer = secondBuffer;
+                    ValueTask<int> pendingRead = default;
+                    bool hasPendingRead = false;
+
+                    try
+                    {
+                        int initialRequest = ComputeReadRequest(
+                            bufferSize,
+                            needRawContentScan,
+                            rawBytesRemaining,
+                            needParserProbe,
+                            needParserPrefix,
+                            Math.Max(0, prefixTarget - prefixLength));
+
+                        if (initialRequest > 0)
                         {
-                            int read = await fs.ReadAsync(buffer.AsMemory(0, bufferSize), ct).ConfigureAwait(false);
-                            if (read == 0) break;
+                            pendingRead = RandomAccess.ReadAsync(handle, currentBuffer.AsMemory(0, initialRequest), fileOffset, ct);
+                            hasPendingRead = true;
+                        }
+
+                        while (!ct.IsCancellationRequested && hasPendingRead)
+                        {
+                            ValueTask<int> currentRead = pendingRead;
+                            hasPendingRead = false;
+                            int read = await currentRead.ConfigureAwait(false);
+                            if (read == 0)
+                                break;
+
+                            long chunkOffset = fileOffset;
+                            long projectedRawRemaining = needRawContentScan
+                                ? Math.Max(0, rawBytesRemaining - Math.Min(rawBytesRemaining, read))
+                                : 0;
+                            long projectedPrefixRemaining = needParserPrefix
+                                ? Math.Max(0, prefixTarget - prefixLength - read)
+                                : 0;
+                            int nextRequest = ComputeReadRequest(
+                                bufferSize,
+                                needRawContentScan,
+                                projectedRawRemaining,
+                                needParserProbe,
+                                needParserPrefix,
+                                projectedPrefixRemaining);
+
+                            if (nextRequest > 0)
+                            {
+                                pendingRead = RandomAccess.ReadAsync(
+                                    handle,
+                                    nextBuffer.AsMemory(0, nextRequest),
+                                    fileOffset + read,
+                                    ct);
+                                hasPendingRead = true;
+                            }
 
                             if (!parserCandidateKnown)
                             {
-                                parserCandidate = ForensicParserEngine.MightParse(path, info, buffer.AsSpan(0, read));
+                                parserCandidate = ForensicParserEngine.MightParse(path, info, currentBuffer.AsSpan(0, read));
                                 parserCandidateKnown = true;
                                 prefixTarget = parserCandidate
                                     ? Math.Min(ParserPrefixBytes, fileSize > 0 ? fileSize : ParserPrefixBytes)
@@ -399,18 +454,18 @@ internal sealed class FileKeywordScanner
                                 int targetLength = (int)Math.Min(ParserPrefixBytes, prefixTarget);
                                 prefixBuffer ??= ArrayPool<byte>.Shared.Rent(ParserPrefixBytes);
                                 int copy = Math.Min(read, targetLength - prefixLength);
-                                Buffer.BlockCopy(buffer, 0, prefixBuffer, prefixLength, copy);
+                                Buffer.BlockCopy(currentBuffer, 0, prefixBuffer, prefixLength, copy);
                                 prefixLength += copy;
                             }
 
                             if (needRawContentScan)
                             {
                                 int rawReadLength = (int)Math.Min(read, Math.Max(0, rawBytesRemaining));
-                                long chunkOffset = fileOffset;
                                 if (rawReadLength > 0)
                                 {
+                                    byte[] evidenceBuffer = currentBuffer;
                                     _matcher.SearchBytesUnique(
-                                        buffer.AsMemory(0, rawReadLength),
+                                        currentBuffer.AsMemory(0, rawReadLength),
                                         ref byteMatcherState,
                                         contentHitsForFile,
                                         ref remainingContentKeywords,
@@ -421,7 +476,7 @@ internal sealed class FileKeywordScanner
                                                 "FILE-CONTENT",
                                                 hit.Keyword.Text,
                                                 path,
-                                                evidenceFactory: () => EvidenceFormatter.Binary(buffer, rawReadLength, hit, chunkOffset),
+                                                evidenceFactory: () => EvidenceFormatter.Binary(evidenceBuffer, rawReadLength, hit, chunkOffset),
                                                 cleanupEligible: job.CleanupEligible);
                                             return !ct.IsCancellationRequested;
                                         });
@@ -439,7 +494,48 @@ internal sealed class FileKeywordScanner
                             needRawContentScan = rawContentAllowed && _matcher.HasBytePatterns && remainingContentKeywords > 0 && rawBytesRemaining > 0;
                             needParserProbe = !parserCandidateKnown;
                             needParserPrefix = parserCandidate && prefixLength < prefixTarget;
+
+                            if (!needRawContentScan && !needParserProbe && !needParserPrefix)
+                            {
+                                if (hasPendingRead)
+                                {
+                                    ValueTask<int> unusedRead = pendingRead;
+                                    hasPendingRead = false;
+                                    await unusedRead.ConfigureAwait(false);
+                                }
+
+                                break;
+                            }
+
+                            if (!hasPendingRead)
+                            {
+                                int request = ComputeReadRequest(
+                                    bufferSize,
+                                    needRawContentScan,
+                                    rawBytesRemaining,
+                                    needParserProbe,
+                                    needParserPrefix,
+                                    Math.Max(0, prefixTarget - prefixLength));
+                                if (request <= 0)
+                                    break;
+
+                                pendingRead = RandomAccess.ReadAsync(handle, nextBuffer.AsMemory(0, request), fileOffset, ct);
+                                hasPendingRead = true;
+                            }
+
+                            (currentBuffer, nextBuffer) = (nextBuffer, currentBuffer);
                         }
+                    }
+                    finally
+                    {
+                        if (hasPendingRead)
+                        {
+                            ValueTask<int> outstandingRead = pendingRead;
+                            hasPendingRead = false;
+                            try { await outstandingRead.ConfigureAwait(false); }
+                            catch { }
+                        }
+                    }
                 }
                 catch (OperationCanceledException) { }
                 catch (Exception ex) { ScannerDiagnostics.Error($"Content read error on {path}: {ex.Message}"); }
@@ -469,7 +565,7 @@ internal sealed class FileKeywordScanner
     {
         try
         {
-            using var fs = PrivilegedFile.OpenRead(job.Path, _readBufferBytes, PrivilegeHelper.IsBackupPrivilegeEnabled);
+            using var fs = PrivilegedFile.OpenRead(job.Path, PrivilegeHelper.IsBackupPrivilegeEnabled);
             using var archive = new System.IO.Compression.ZipArchive(fs, System.IO.Compression.ZipArchiveMode.Read, leaveOpen: false);
 
             int listed = 0;
@@ -680,7 +776,7 @@ internal sealed class FileKeywordScanner
             return false;
 
         string extension = "";
-        try { extension = (info?.Extension ?? Path.GetExtension(path)).ToLowerInvariant(); } catch { }
+        try { extension = info?.Extension ?? Path.GetExtension(path); } catch { }
 
         if (SmartSkipRawContentExtensions.Contains(extension))
             return false;
@@ -757,6 +853,38 @@ internal sealed class FileKeywordScanner
                p.EndsWith("\\$LogFile", StringComparison.OrdinalIgnoreCase) ||
                p.Contains("\\$Extend\\$UsnJrnl:", StringComparison.OrdinalIgnoreCase);
     }
+
+    private static int ComputeReadRequest(
+        int bufferSize,
+        bool needRawContent,
+        long rawBytesRemaining,
+        bool needParserProbe,
+        bool needParserPrefix,
+        long prefixBytesRemaining)
+    {
+        long requested = 0;
+        if (needRawContent && rawBytesRemaining > 0)
+            requested = Math.Min(bufferSize, rawBytesRemaining);
+
+        if (needParserProbe)
+            requested = bufferSize;
+
+        if (needParserPrefix && prefixBytesRemaining > 0)
+            requested = Math.Max(requested, Math.Min(bufferSize, prefixBytesRemaining));
+
+        return (int)Math.Clamp(requested, 0, bufferSize);
+    }
+
+    private static EnumeratedEntry CreateEnumeratedEntry(ref System.IO.Enumeration.FileSystemEntry entry)
+    {
+        bool isDirectory = entry.IsDirectory;
+        return new EnumeratedEntry(
+            entry.ToFullPath(),
+            isDirectory,
+            isDirectory ? -1 : Math.Max(0, entry.Length));
+    }
+
+    private readonly record struct EnumeratedEntry(string Path, bool IsDirectory, long Length);
 }
 
 // Job types

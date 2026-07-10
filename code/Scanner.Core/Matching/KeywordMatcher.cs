@@ -5,18 +5,27 @@ internal sealed class KeywordMatcher
     private readonly AhoCorasick _byteMatcher;
     private readonly AhoCorasick _textMatcher;
     private readonly SearchValues<byte>? _byteStartAnchors;
+    private readonly bool _useIntraChunkPrefilter;
 
     public PreparedKeyword[] Keywords { get; }
     public bool HasBytePatterns => _byteMatcher.HasPatterns;
     public int ByteSearchableKeywordCount { get; }
+    internal bool UsesCompactTransitions => _byteMatcher.UsesCompactTransitions && _textMatcher.UsesCompactTransitions;
 
-    private KeywordMatcher(PreparedKeyword[] k, AhoCorasick bm, AhoCorasick tm, int byteSearchableKeywordCount, SearchValues<byte>? byteStartAnchors)
+    private KeywordMatcher(
+        PreparedKeyword[] k,
+        AhoCorasick bm,
+        AhoCorasick tm,
+        int byteSearchableKeywordCount,
+        SearchValues<byte>? byteStartAnchors,
+        bool useIntraChunkPrefilter)
     {
         Keywords = k;
         _byteMatcher = bm;
         _textMatcher = tm;
         ByteSearchableKeywordCount = byteSearchableKeywordCount;
         _byteStartAnchors = byteStartAnchors;
+        _useIntraChunkPrefilter = useIntraChunkPrefilter;
     }
 
     public static KeywordMatcher Build(PreparedKeyword[] k)
@@ -51,7 +60,8 @@ internal sealed class KeywordMatcher
         SearchValues<byte>? anchors = byteStartAnchors.Count is > 0 and < 192
             ? SearchValues.Create(byteStartAnchors.ToArray())
             : null;
-        return new KeywordMatcher(k, bm, tm, byteSearchableKeywordCount, anchors);
+        bool useIntraChunkPrefilter = anchors != null && byteStartAnchors.Count <= 16;
+        return new KeywordMatcher(k, bm, tm, byteSearchableKeywordCount, anchors, useIntraChunkPrefilter);
     }
 
     public void SearchBytesUnique(
@@ -67,7 +77,13 @@ internal sealed class KeywordMatcher
         if (state == 0 && _byteStartAnchors != null && data.Span.IndexOfAny(_byteStartAnchors) < 0)
             return;
 
-        _byteMatcher.SearchBytesUnique(data.Span, ref state, keywordHits, ref remainingKeywords, onNewKeyword);
+        _byteMatcher.SearchBytesUnique(
+            data.Span,
+            ref state,
+            keywordHits,
+            ref remainingKeywords,
+            onNewKeyword,
+            _useIntraChunkPrefilter ? _byteStartAnchors : null);
     }
 
     public IEnumerable<TextSearchHit> SearchDecodedText(string text)
@@ -113,11 +129,14 @@ internal sealed class KeywordMatcher
     private sealed class AhoCorasick
     {
         private readonly List<Node> _nodes = new() { new Node() };
-        private int[]? _byteTransitionsFlat;
-        private int[]? _asciiTransitionsFlat;
+        private ushort[]? _byteTransitionsCompact;
+        private int[]? _byteTransitionsWide;
+        private ushort[]? _asciiTransitionsCompact;
+        private int[]? _asciiTransitionsWide;
         private bool _built;
 
         public bool HasPatterns { get; private set; }
+        public bool UsesCompactTransitions => _byteTransitionsCompact != null || _asciiTransitionsCompact != null;
 
         public void Add(IEnumerable<int> symbols, AhoOutput output)
         {
@@ -174,42 +193,73 @@ internal sealed class KeywordMatcher
 
         private void BuildByteTransitions()
         {
-            _byteTransitionsFlat = new int[_nodes.Count * 256];
+            int transitionCount = checked(_nodes.Count * 256);
+            if (_nodes.Count <= ushort.MaxValue + 1)
+            {
+                var transitions = new ushort[transitionCount];
+                for (int i = 0; i < _nodes.Count; i++)
+                {
+                    int row = i << 8;
+                    for (int b = 0; b < 256; b++)
+                        transitions[row + b] = (ushort)ResolveTransition(i, ByteMatcher.UpperAscii((byte)b));
+                }
 
+                _byteTransitionsCompact = transitions;
+                return;
+            }
+
+            var wideTransitions = new int[transitionCount];
             for (int i = 0; i < _nodes.Count; i++)
             {
                 int row = i << 8;
                 for (int b = 0; b < 256; b++)
-                {
-                    int folded = ByteMatcher.UpperAscii((byte)b);
-                    int state = i;
-
-                    while (state != 0 && !_nodes[state].Next.ContainsKey(folded))
-                        state = _nodes[state].Fail;
-
-                    _byteTransitionsFlat[row + b] = _nodes[state].Next.TryGetValue(folded, out int n) ? n : 0;
-                }
+                    wideTransitions[row + b] = ResolveTransition(i, ByteMatcher.UpperAscii((byte)b));
             }
+
+            _byteTransitionsWide = wideTransitions;
         }
 
         private void BuildAsciiTransitions()
         {
-            _asciiTransitionsFlat = new int[_nodes.Count * 128];
+            int transitionCount = checked(_nodes.Count * 128);
+            if (_nodes.Count <= ushort.MaxValue + 1)
+            {
+                var transitions = new ushort[transitionCount];
+                for (int i = 0; i < _nodes.Count; i++)
+                {
+                    int row = i << 7;
+                    for (int c = 0; c < 128; c++)
+                    {
+                        int folded = c is >= 'a' and <= 'z' ? c - 32 : c;
+                        transitions[row + c] = (ushort)ResolveTransition(i, folded);
+                    }
+                }
 
+                _asciiTransitionsCompact = transitions;
+                return;
+            }
+
+            var wideTransitions = new int[transitionCount];
             for (int i = 0; i < _nodes.Count; i++)
             {
                 int row = i << 7;
                 for (int c = 0; c < 128; c++)
                 {
                     int folded = c is >= 'a' and <= 'z' ? c - 32 : c;
-                    int state = i;
-
-                    while (state != 0 && !_nodes[state].Next.ContainsKey(folded))
-                        state = _nodes[state].Fail;
-
-                    _asciiTransitionsFlat[row + c] = _nodes[state].Next.TryGetValue(folded, out int n) ? n : 0;
+                    wideTransitions[row + c] = ResolveTransition(i, folded);
                 }
             }
+
+            _asciiTransitionsWide = wideTransitions;
+        }
+
+        private int ResolveTransition(int initialState, int symbol)
+        {
+            int state = initialState;
+            while (state != 0 && !_nodes[state].Next.ContainsKey(symbol))
+                state = _nodes[state].Fail;
+
+            return _nodes[state].Next.TryGetValue(symbol, out int next) ? next : 0;
         }
 
         public void SearchBytesUnique(
@@ -217,14 +267,30 @@ internal sealed class KeywordMatcher
             ref int state,
             KeywordHitTracker keywordHits,
             ref int remainingKeywords,
-            Func<ByteSearchHit, bool> onNewKeyword)
+            Func<ByteSearchHit, bool> onNewKeyword,
+            SearchValues<byte>? startAnchors)
         {
-            var transitions = _byteTransitionsFlat;
-            if (transitions == null || remainingKeywords <= 0) return;
+            var compactTransitions = _byteTransitionsCompact;
+            var wideTransitions = _byteTransitionsWide;
+            if ((compactTransitions == null && wideTransitions == null) || remainingKeywords <= 0)
+                return;
 
-            for (int i = 0; i < data.Length && remainingKeywords > 0; i++)
+            int i = 0;
+            while (i < data.Length && remainingKeywords > 0)
             {
-                state = transitions[(state << 8) + data[i]];
+                if (state == 0 && startAnchors != null)
+                {
+                    int skip = data[i..].IndexOfAny(startAnchors);
+                    if (skip < 0)
+                        return;
+
+                    i += skip;
+                }
+
+                int transitionIndex = (state << 8) + data[i];
+                state = compactTransitions != null
+                    ? compactTransitions[transitionIndex]
+                    : wideTransitions![transitionIndex];
                 var outputs = _nodes[state].Outputs;
 
                 for (int j = 0; j < outputs.Count; j++)
@@ -243,19 +309,25 @@ internal sealed class KeywordMatcher
                     if (remainingKeywords <= 0)
                         return;
                 }
+
+                i++;
             }
         }
 
         public IEnumerable<AhoMatch> SearchText(string text)
         {
-            var asciiTransitions = _asciiTransitionsFlat;
+            var compactAsciiTransitions = _asciiTransitionsCompact;
+            var wideAsciiTransitions = _asciiTransitionsWide;
             int state = 0;
             for (int i = 0; i < text.Length; i++)
             {
                 char c = text[i];
-                if (c < 128 && asciiTransitions != null)
+                if (c < 128 && (compactAsciiTransitions != null || wideAsciiTransitions != null))
                 {
-                    state = asciiTransitions[(state << 7) + c];
+                    int transitionIndex = (state << 7) + c;
+                    state = compactAsciiTransitions != null
+                        ? compactAsciiTransitions[transitionIndex]
+                        : wideAsciiTransitions![transitionIndex];
                 }
                 else
                 {

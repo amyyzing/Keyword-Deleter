@@ -1,4 +1,5 @@
 using Scanner.Core;
+using System.Text;
 
 internal static class Program
 {
@@ -66,10 +67,13 @@ internal static class Program
             };
             Assert(FindingCleanupService.CountTargets(findings) == 1, "Scan-only findings should not become cleanup targets.");
 
+            RunArtifactClassificationTests();
             RunTextMatcherFastPathTest();
+            RunByteMatcherDifferentialTest();
             RunSmallFileScan(root).GetAwaiter().GetResult();
             RunMultipleRootScan(root).GetAwaiter().GetResult();
             RunChunkBoundaryScan(root).GetAwaiter().GetResult();
+            RunConcurrentRandomAccessScan(root).GetAwaiter().GetResult();
             RunSmartContentGateScan(root).GetAwaiter().GetResult();
             RunArchiveEntryScan(root).GetAwaiter().GetResult();
             RunDeepArchiveCoverageScan(root).GetAwaiter().GetResult();
@@ -124,10 +128,128 @@ internal static class Program
             "ASCII transition table should fall back correctly for Unicode text.");
     }
 
+    private static void RunByteMatcherDifferentialTest()
+    {
+        var prepared = new[]
+        {
+            PreparedKeyword.Prepare("alpha", 0),
+            PreparedKeyword.Prepare("beta", 1),
+            PreparedKeyword.Prepare("gamma", 2)
+        };
+        var matcher = KeywordMatcher.Build(prepared);
+        Assert(matcher.UsesCompactTransitions,
+            "Small keyword sets should use compact 16-bit transition tables.");
+
+        byte[] data = Enumerable.Repeat((byte)'x', 20_000).ToArray();
+        CopyInto(data, 4_094, Encoding.ASCII.GetBytes("aLpHa"));
+        CopyInto(data, 255, Encoding.Unicode.GetBytes("BeTa"));
+        CopyInto(data, 8_190, Encoding.BigEndianUnicode.GetBytes("gAmMa"));
+
+        foreach (int chunkSize in new[] { 17, 257, 4_096, 65_536 })
+        {
+            var tracker = new KeywordHitTracker(prepared.Length);
+            var found = new HashSet<int>();
+            int state = 0;
+            int remaining = matcher.ByteSearchableKeywordCount;
+
+            for (int offset = 0; offset < data.Length; offset += chunkSize)
+            {
+                int length = Math.Min(chunkSize, data.Length - offset);
+                matcher.SearchBytesUnique(
+                    data.AsMemory(offset, length),
+                    ref state,
+                    tracker,
+                    ref remaining,
+                    hit =>
+                    {
+                        found.Add(hit.Keyword.Index);
+                        return true;
+                    });
+            }
+
+            Assert(remaining == 0 && found.SetEquals(new[] { 0, 1, 2 }),
+                $"Compact matcher/prefilter lost an encoded or boundary-spanning hit at chunk size {chunkSize}.");
+        }
+    }
+
+    private static void CopyInto(byte[] destination, int offset, byte[] source) =>
+        Buffer.BlockCopy(source, 0, destination, offset, source.Length);
+
+    private static void RunArtifactClassificationTests()
+    {
+        (string Path, string Expected)[] fileCases =
+        [
+            (@"C:\WINDOWS\Prefetch\APP.EXE-1234.pf", "Prefetch-Execution"),
+            (@"C:\$MFT", "NTFS-MFT"),
+            (@"C:\$Extend\$UsnJrnl:$J", "NTFS-USNJournal"),
+            (@"C:\Windows\System32\winevt\Logs\Application.EVTX", "EventLog-EVTX"),
+            (@"C:\Windows\System32\Config\SYSTEM", "SystemHive"),
+            (@"C:\Windows\System32\Config\RegBack\SOFTWARE", "SystemHive-RegBack"),
+            (@"C:\Windows\AppCompat\Programs\Amcache.hve.LOG1", "Amcache-TransactionLog"),
+            (@"C:\Windows\AppCompat\PCA\PcaAppLaunchDic.txt", "AppCompat-PCA"),
+            (@"C:\ProgramData\Microsoft\Network\Downloader\qmgr0.dat", "BITS-Qmgr"),
+            (@"C:\Windows\System32\Tasks\Vendor\Task", "ScheduledTask"),
+            (@"C:\Users\Alice\AppData\Roaming\Microsoft\Windows\Recent\AutomaticDestinations\a.ms", "JumpList-AutomaticDestinations"),
+            (@"C:\Users\Alice\AppData\Local\Packages\App\Settings\settings.dat", "PackageSettingsHive"),
+            (@"C:\Users\Alice\AppData\Local\Microsoft\Windows\UsrClass.dat.regtrans-ms", "UsrClassDat-TransactionLog"),
+            (@"C:\Users\Alice\NTUSER.DAT", "NTUSER-DAT"),
+            (@"C:\ProgramData\Microsoft\Windows Defender\Scans\History\Service\DetectionHistory\x", "DefenderDetectionHistory"),
+            (@"C:\Windows\INF\setupapi.dev.LOG", "SetupAPI"),
+            (@"C:\Users\Alice\AppData\Local\BraveSoftware\Brave-Browser\User Data\Default\History", "BrowserProfile-Brave"),
+            (@"C:\Users\Alice\AppData\Local\Google\Chrome\User Data\Default\History", "BrowserProfile-ChromeEdge"),
+            (@"C:\Users\Alice\AppData\Roaming\zen\Profiles\default\places.sqlite", "BrowserProfile-Zen"),
+            (@"C:\ProgramData\AnyDesk\ad.trace", "RemoteAdmin-AnyDesk"),
+            (@"C:\Users\Alice\.ssh\config", "OpenSSH"),
+            (@"C:\Users\Alice\AppData\Roaming\rclone\rclone.conf", "RcloneConfig"),
+            (@"C:\Users\Alice\AppData\Local\Roblox\logs\log.txt", "RobloxLogs"),
+            (@"C:\Users\Alice\AppData\Local\Temp\sample.tmp", "Temp"),
+            ("C:/USERS/ALICE/APPDATA/ROAMING/SLACK/logs/app.log", "Slack"),
+            (@"C:\Data\ordinary.bin", "")
+        ];
+
+        foreach (var test in fileCases)
+        {
+            Assert(ArtifactCatalog.ClassifyFilePath(test.Path) == test.Expected,
+                $"File classifier mismatch for {test.Path}.");
+        }
+
+        (string Path, string Expected)[] registryCases =
+        [
+            (@"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist", "UserAssist-Execution"),
+            (@"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\RunMRU", "RunMRU"),
+            (@"HKLM\SYSTEM\CurrentControlSet\Services\BAM\State", "BAM-DAM-Execution"),
+            (@"HKLM\SYSTEM\CurrentControlSet\Services\Example", "Services-Drivers"),
+            (@"HKLM\Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options", "IFEO"),
+            (@"HKCU\Software\Microsoft\Terminal Server Client\Servers", "RDP-TerminalServerClient"),
+            (@"HKCU\Software\OpenSSH", "OpenSSH"),
+            (@"HKCU\Software\Unrelated", "")
+        ];
+
+        foreach (var test in registryCases)
+        {
+            Assert(ArtifactCatalog.ClassifyRegistryPath(test.Path) == test.Expected,
+                $"Registry classifier mismatch for {test.Path}.");
+        }
+
+        Assert(ForensicParserEngine.MightParseByPath(@"C:\Users\Alice\HISTORY", null),
+            "Parser gating should recognize extensionless browser databases without lowercasing paths.");
+        Assert(ForensicParserEngine.MightParseByPath(@"C:\Windows\Logs\APP.BIN", null),
+            "Parser gating should recognize mixed-case log paths.");
+        Assert(ForensicParserEngine.MightParseByPath(@"C:\Data\REPORT.JSON", null),
+            "Parser gating should recognize mixed-case parser extensions.");
+        Assert(ForensicParserEngine.IsZipLikePath(@"C:\Data\PACKAGE.ZIP"),
+            "ZIP-family detection should remain case-insensitive.");
+        Assert(!ForensicParserEngine.MightParseByPath(@"C:\Data\ordinary.bin", null),
+            "Parser gating should not broaden unrelated binary files.");
+    }
+
     private static async Task RunSmallFileScan(string root)
     {
         string scanRoot = Path.Combine(root, "ScanRoot");
         Touch(Path.Combine(scanRoot, "sample.txt"));
+        string hiddenFile = Path.Combine(scanRoot, "Nested", "hidden-keyword.txt");
+        Touch(hiddenFile);
+        File.SetAttributes(hiddenFile, File.GetAttributes(hiddenFile) | FileAttributes.Hidden);
 
         var matcher = KeywordMatcher.Build([PreparedKeyword.Prepare("keyword", 0)]);
         var collector = new MatchCollector();
@@ -148,6 +270,8 @@ internal static class Program
         var results = collector.GetFindings();
 
         Assert(results.Any(f => f.Location.EndsWith("sample.txt", StringComparison.OrdinalIgnoreCase)), "Small temp-root file scan should find sample.txt.");
+        Assert(results.Any(f => f.Location.Equals(hiddenFile, StringComparison.OrdinalIgnoreCase)),
+            "Raw filesystem enumeration should preserve nested hidden-file coverage.");
         Assert(results.All(f => f.CleanupEligible), "Default explicit scan roots should remain cleanup-eligible.");
     }
 
@@ -203,6 +327,48 @@ internal static class Program
         var payload = await service.RunAsync(options);
         Assert(payload.Findings.Any(f => f.Kind == "FILE-CONTENT" && f.Location.Equals(file, StringComparison.OrdinalIgnoreCase)),
             "Byte prefilter should not skip matches that continue across read-buffer boundaries.");
+    }
+
+    private static async Task RunConcurrentRandomAccessScan(string root)
+    {
+        const int bufferSize = 64 * 1024;
+        const string keyword = "parallel-boundary-keyword";
+        string scanRoot = Path.Combine(root, "ConcurrentRandomAccess");
+        Directory.CreateDirectory(scanRoot);
+        byte[] marker = Encoding.ASCII.GetBytes(keyword);
+        var expectedFiles = new List<string>();
+
+        for (int i = 0; i < 12; i++)
+        {
+            byte[] data = Enumerable.Repeat((byte)'q', 3 * bufferSize).ToArray();
+            CopyInto(data, bufferSize - 3, marker);
+            string file = Path.Combine(scanRoot, $"parallel-{i:D2}.bin");
+            File.WriteAllBytes(file, data);
+            expectedFiles.Add(file);
+        }
+
+        var options = new ScanOptions
+        {
+            SkipElevation = true,
+            SkipRegistry = true,
+            DeepContentScan = true,
+            DirectoryEnumWorkers = 2,
+            FileReadWorkers = 4,
+            MaxReadsPerVolume = 4,
+            ParserWorkers = 1,
+            ReadBufferBytes = bufferSize
+        };
+        options.Keywords.Add(keyword);
+        options.Roots.Add(scanRoot);
+
+        var payload = await new ScannerService().RunAsync(options);
+        foreach (string file in expectedFiles)
+        {
+            Assert(payload.Findings.Any(f =>
+                    f.Kind == "FILE-CONTENT" &&
+                    f.Location.Equals(file, StringComparison.OrdinalIgnoreCase)),
+                $"Double-buffered RandomAccess scanning lost the boundary match in {file}.");
+        }
     }
 
     private static async Task RunSmartContentGateScan(string root)

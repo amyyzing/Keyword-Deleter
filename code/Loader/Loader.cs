@@ -51,7 +51,7 @@ internal static class Loader
             MaxReadsPerVolume = Math.Clamp(processors, 8, 24),
             ParserWorkers = Math.Clamp(processors, 2, 16),
             RegistryWorkers = 8,
-            ReadBufferBytes = 4 * 1024 * 1024
+            ReadBufferBytes = 1024 * 1024
         };
     }
 

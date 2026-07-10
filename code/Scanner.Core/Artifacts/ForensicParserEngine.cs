@@ -7,6 +7,21 @@ internal static class ForensicParserEngine
     private const int MaxZipEntries = 300;
     private const int MaxTextEntryBytes = 1024 * 1024;
 
+    private static readonly HashSet<string> ZipLikeExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".zip", ".docx", ".xlsx", ".pptx", ".jar", ".nupkg", ".vsix", ".odt", ".ods", ".odp"
+    };
+
+    private static readonly HashSet<string> ParserCandidateExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".zip", ".docx", ".xlsx", ".pptx", ".jar", ".nupkg", ".vsix", ".odt", ".ods", ".odp",
+        ".exe", ".dll", ".sys", ".scr", ".com", ".cpl", ".msi", ".lnk", ".pf", ".evtx",
+        ".automaticdestinations-ms", ".customdestinations-ms", ".ole", ".doc", ".xls", ".ppt",
+        ".xml", ".json", ".jsonl", ".txt", ".log", ".csv", ".ini", ".cfg", ".conf", ".url",
+        ".ps1", ".psm1", ".psd1", ".bat", ".cmd", ".vbs", ".js", ".yml", ".yaml", ".html",
+        ".htm", ".rdp", ".ovpn"
+    };
+
     public static ParsedArtifact? TryParse(string path, CancellationToken token)
     {
         if (token.IsCancellationRequested || string.IsNullOrWhiteSpace(path)) return null;
@@ -42,66 +57,51 @@ internal static class ForensicParserEngine
         if (string.IsNullOrWhiteSpace(path))
             return false;
 
-        string lowerPath = path.Replace('/', '\\').ToLowerInvariant();
+        string normalizedPath = path.IndexOf('/') >= 0 ? path.Replace('/', '\\') : path;
         string ext = "";
-        try { ext = (info?.Extension ?? Path.GetExtension(path)).ToLowerInvariant(); } catch { }
+        try { ext = info?.Extension ?? Path.GetExtension(path); } catch { }
 
-        bool taskHint = lowerPath.Contains("\\windows\\system32\\tasks\\") ||
-                        lowerPath.Contains("\\system32\\tasks\\");
-        bool logHint = lowerPath.Contains("\\logs\\", StringComparison.Ordinal) ||
-                       lowerPath.Contains("\\logfiles\\", StringComparison.Ordinal) ||
-                       lowerPath.Contains("consolehost_history.txt", StringComparison.Ordinal) ||
-                       lowerPath.Contains("\\windows defender\\", StringComparison.Ordinal) ||
-                       lowerPath.Contains("\\microsoft\\windows\\wer\\", StringComparison.Ordinal) ||
-                       lowerPath.Contains("\\crashdumps\\", StringComparison.Ordinal);
-        bool registryHiveNameHint = lowerPath.EndsWith("ntuser.dat", StringComparison.Ordinal) ||
-                                    lowerPath.EndsWith("usrclass.dat", StringComparison.Ordinal) ||
-                                    lowerPath.EndsWith("amcache.hve", StringComparison.Ordinal) ||
-                                    lowerPath.EndsWith("\\system", StringComparison.Ordinal) ||
-                                    lowerPath.EndsWith("\\software", StringComparison.Ordinal) ||
-                                    lowerPath.EndsWith("\\sam", StringComparison.Ordinal) ||
-                                    lowerPath.EndsWith("\\security", StringComparison.Ordinal) ||
-                                    lowerPath.EndsWith("\\default", StringComparison.Ordinal) ||
-                                    lowerPath.EndsWith("\\components", StringComparison.Ordinal) ||
-                                    lowerPath.EndsWith(".hve", StringComparison.Ordinal);
-        bool sqliteNameHint = lowerPath.EndsWith(".sqlite", StringComparison.Ordinal) ||
-                              lowerPath.EndsWith(".sqlite3", StringComparison.Ordinal) ||
-                              lowerPath.EndsWith(".db", StringComparison.Ordinal) ||
-                              lowerPath.EndsWith("cookies", StringComparison.Ordinal) ||
-                              lowerPath.EndsWith("history", StringComparison.Ordinal) ||
-                              lowerPath.EndsWith("web data", StringComparison.Ordinal) ||
-                              lowerPath.EndsWith("login data", StringComparison.Ordinal) ||
-                              lowerPath.EndsWith("favicons", StringComparison.Ordinal) ||
-                              lowerPath.EndsWith("top sites", StringComparison.Ordinal) ||
-                              lowerPath.EndsWith("shortcuts", StringComparison.Ordinal) ||
-                              lowerPath.EndsWith("places.sqlite", StringComparison.Ordinal) ||
-                              lowerPath.EndsWith("activitiescache.db", StringComparison.Ordinal);
-        bool eseNameHint = lowerPath.EndsWith("srudb.dat", StringComparison.Ordinal) ||
-                           lowerPath.EndsWith("webcachev01.dat", StringComparison.Ordinal) ||
-                           lowerPath.EndsWith("qmgr0.dat", StringComparison.Ordinal) ||
-                           lowerPath.EndsWith("qmgr1.dat", StringComparison.Ordinal) ||
-                           lowerPath.Contains("\\windows.edb", StringComparison.Ordinal);
-        bool jumpListHint = lowerPath.EndsWith(".automaticdestinations-ms", StringComparison.Ordinal) ||
-                            lowerPath.EndsWith(".customdestinations-ms", StringComparison.Ordinal);
-        bool knownText = ext is ".txt" or ".log" or ".csv" or ".ini" or ".cfg" or ".conf" or ".url"
-                         or ".ps1" or ".psm1" or ".psd1" or ".bat" or ".cmd" or ".vbs" or ".js"
-                         or ".yml" or ".yaml" or ".html" or ".htm" or ".rdp" or ".ovpn";
+        bool taskHint = normalizedPath.Contains("\\windows\\system32\\tasks\\", StringComparison.OrdinalIgnoreCase) ||
+                        normalizedPath.Contains("\\system32\\tasks\\", StringComparison.OrdinalIgnoreCase);
+        bool logHint = normalizedPath.Contains("\\logs\\", StringComparison.OrdinalIgnoreCase) ||
+                       normalizedPath.Contains("\\logfiles\\", StringComparison.OrdinalIgnoreCase) ||
+                       normalizedPath.Contains("consolehost_history.txt", StringComparison.OrdinalIgnoreCase) ||
+                       normalizedPath.Contains("\\windows defender\\", StringComparison.OrdinalIgnoreCase) ||
+                       normalizedPath.Contains("\\microsoft\\windows\\wer\\", StringComparison.OrdinalIgnoreCase) ||
+                       normalizedPath.Contains("\\crashdumps\\", StringComparison.OrdinalIgnoreCase);
+        bool registryHiveNameHint = normalizedPath.EndsWith("ntuser.dat", StringComparison.OrdinalIgnoreCase) ||
+                                    normalizedPath.EndsWith("usrclass.dat", StringComparison.OrdinalIgnoreCase) ||
+                                    normalizedPath.EndsWith("amcache.hve", StringComparison.OrdinalIgnoreCase) ||
+                                    normalizedPath.EndsWith("\\system", StringComparison.OrdinalIgnoreCase) ||
+                                    normalizedPath.EndsWith("\\software", StringComparison.OrdinalIgnoreCase) ||
+                                    normalizedPath.EndsWith("\\sam", StringComparison.OrdinalIgnoreCase) ||
+                                    normalizedPath.EndsWith("\\security", StringComparison.OrdinalIgnoreCase) ||
+                                    normalizedPath.EndsWith("\\default", StringComparison.OrdinalIgnoreCase) ||
+                                    normalizedPath.EndsWith("\\components", StringComparison.OrdinalIgnoreCase) ||
+                                    normalizedPath.EndsWith(".hve", StringComparison.OrdinalIgnoreCase);
+        bool sqliteNameHint = normalizedPath.EndsWith(".sqlite", StringComparison.OrdinalIgnoreCase) ||
+                              normalizedPath.EndsWith(".sqlite3", StringComparison.OrdinalIgnoreCase) ||
+                              normalizedPath.EndsWith(".db", StringComparison.OrdinalIgnoreCase) ||
+                              normalizedPath.EndsWith("cookies", StringComparison.OrdinalIgnoreCase) ||
+                              normalizedPath.EndsWith("history", StringComparison.OrdinalIgnoreCase) ||
+                              normalizedPath.EndsWith("web data", StringComparison.OrdinalIgnoreCase) ||
+                              normalizedPath.EndsWith("login data", StringComparison.OrdinalIgnoreCase) ||
+                              normalizedPath.EndsWith("favicons", StringComparison.OrdinalIgnoreCase) ||
+                              normalizedPath.EndsWith("top sites", StringComparison.OrdinalIgnoreCase) ||
+                              normalizedPath.EndsWith("shortcuts", StringComparison.OrdinalIgnoreCase) ||
+                              normalizedPath.EndsWith("places.sqlite", StringComparison.OrdinalIgnoreCase) ||
+                              normalizedPath.EndsWith("activitiescache.db", StringComparison.OrdinalIgnoreCase);
+        bool eseNameHint = normalizedPath.EndsWith("srudb.dat", StringComparison.OrdinalIgnoreCase) ||
+                           normalizedPath.EndsWith("webcachev01.dat", StringComparison.OrdinalIgnoreCase) ||
+                           normalizedPath.EndsWith("qmgr0.dat", StringComparison.OrdinalIgnoreCase) ||
+                           normalizedPath.EndsWith("qmgr1.dat", StringComparison.OrdinalIgnoreCase) ||
+                           normalizedPath.Contains("\\windows.edb", StringComparison.OrdinalIgnoreCase);
 
-        return IsZipLike(ext) ||
-               ext is ".exe" or ".dll" or ".sys" or ".scr" or ".com" or ".cpl" or ".msi" ||
-               ext == ".lnk" ||
-               ext == ".pf" ||
-               ext == ".evtx" ||
+        return ParserCandidateExtensions.Contains(ext) ||
                registryHiveNameHint ||
                sqliteNameHint ||
                eseNameHint ||
-               jumpListHint ||
-               ext is ".automaticdestinations-ms" or ".customdestinations-ms" ||
-               ext is ".ole" or ".doc" or ".xls" or ".ppt" ||
                taskHint ||
-               ext == ".xml" ||
-               ext is ".json" or ".jsonl" ||
-               knownText ||
                logHint;
     }
 
@@ -186,7 +186,7 @@ internal static class ForensicParserEngine
     {
         try
         {
-            using var fs = PrivilegedFile.OpenRead(path, 1024 * 1024, PrivilegeHelper.IsBackupPrivilegeEnabled);
+            using var fs = PrivilegedFile.OpenRead(path, PrivilegeHelper.IsBackupPrivilegeEnabled);
             int toRead = (int)Math.Min(maxBytes, Math.Max(0, fs.Length));
             var buffer = new byte[toRead];
             int total = 0;
@@ -205,11 +205,11 @@ internal static class ForensicParserEngine
 
     public static bool IsZipLikePath(string path)
     {
-        try { return IsZipLike(Path.GetExtension(path).ToLowerInvariant()); }
+        try { return IsZipLike(Path.GetExtension(path)); }
         catch { return false; }
     }
 
-    private static bool IsZipLike(string ext) => ext is ".zip" or ".docx" or ".xlsx" or ".pptx" or ".jar" or ".nupkg" or ".vsix" or ".odt" or ".ods" or ".odp";
+    private static bool IsZipLike(string ext) => ZipLikeExtensions.Contains(ext);
 
     private static bool LooksLikePe(ReadOnlySpan<byte> b)
     {
@@ -251,7 +251,7 @@ internal static class ForensicParserEngine
     {
         try
         {
-            using var fs = PrivilegedFile.OpenRead(path, 1024 * 1024, PrivilegeHelper.IsBackupPrivilegeEnabled);
+            using var fs = PrivilegedFile.OpenRead(path, PrivilegeHelper.IsBackupPrivilegeEnabled);
             using var zip = new System.IO.Compression.ZipArchive(fs, System.IO.Compression.ZipArchiveMode.Read, leaveOpen: false);
             string kind = info.Extension.ToLowerInvariant() switch
             {

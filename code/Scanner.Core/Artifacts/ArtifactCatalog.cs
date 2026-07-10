@@ -319,148 +319,156 @@ internal static class ArtifactCatalog
 
     public static string ClassifyFilePath(string path)
     {
-        string p = path.Replace('/', '\\').ToLowerInvariant();
-        if (p.Contains("\\windows\\prefetch\\")) return "Prefetch-Execution";
-        if (p.EndsWith("\\$mft")) return "NTFS-MFT";
-        if (p.EndsWith("\\$logfile")) return "NTFS-LogFile";
-        if (p.Contains("\\$extend\\$usnjrnl:$j")) return "NTFS-USNJournal";
-        if (p.Contains("\\system32\\winevt\\logs\\") || p.EndsWith(".evtx")) return "EventLog-EVTX";
-        if (p.Contains("\\system32\\config\\regback\\")) return "SystemHive-RegBack";
-        if (p.Contains("\\system32\\config\\") && IsSystemHivePath(p)) return "SystemHive";
-        if (p.EndsWith("\\amcache.hve")) return "Amcache-Execution";
-        if (p.EndsWith("\\amcache.hve.log1") || p.EndsWith("\\amcache.hve.log2") || p.Contains("\\amcache.hve") && p.EndsWith(".regtrans-ms"))
+        string p = NormalizePathSeparators(path);
+        if (ContainsIgnoreCase(p, "\\windows\\prefetch\\")) return "Prefetch-Execution";
+        if (EndsWithIgnoreCase(p, "\\$mft")) return "NTFS-MFT";
+        if (EndsWithIgnoreCase(p, "\\$logfile")) return "NTFS-LogFile";
+        if (ContainsIgnoreCase(p, "\\$extend\\$usnjrnl:$j")) return "NTFS-USNJournal";
+        if (ContainsIgnoreCase(p, "\\system32\\winevt\\logs\\") || EndsWithIgnoreCase(p, ".evtx")) return "EventLog-EVTX";
+        if (ContainsIgnoreCase(p, "\\system32\\config\\regback\\")) return "SystemHive-RegBack";
+        if (ContainsIgnoreCase(p, "\\system32\\config\\") && IsSystemHivePath(p)) return "SystemHive";
+        if (EndsWithIgnoreCase(p, "\\amcache.hve")) return "Amcache-Execution";
+        if (EndsWithIgnoreCase(p, "\\amcache.hve.log1") || EndsWithIgnoreCase(p, "\\amcache.hve.log2") || ContainsIgnoreCase(p, "\\amcache.hve") && EndsWithIgnoreCase(p, ".regtrans-ms"))
             return "Amcache-TransactionLog";
-        if (p.Contains("\\appcompat\\pca\\")) return "AppCompat-PCA";
-        if (p.EndsWith("\\recentfilecache.bcf")) return "RecentFileCache";
-        if (p.Contains("\\appcompat\\programs\\")) return "AppCompat-Execution";
-        if (p.Contains("\\apppatch\\")) return "SDB-AppPatch";
-        if (p.Contains("\\microsoft\\network\\downloader\\qmgr")) return "BITS-Qmgr";
-        if (p.EndsWith("\\srudb.dat")) return "SRUM-NetworkAppUsage";
-        if (p.Contains("\\system32\\tasks\\")) return "ScheduledTask";
-        if (p.Contains("\\wbem\\repository\\")) return "WMIRepository";
-        if (p.Contains("\\recent\\automaticdestinations\\")) return "JumpList-AutomaticDestinations";
-        if (p.Contains("\\recent\\customdestinations\\")) return "JumpList-CustomDestinations";
-        if (p.Contains("\\microsoft\\windows\\recent\\")) return "RecentFiles";
-        if (p.EndsWith("\\consolehost_history.txt")) return "PowerShellHistory";
-        if (p.Contains("\\powershell\\transcripts\\") || p.Contains("\\windowspowershell\\transcripts\\")) return "PowerShellTranscripts";
-        if (p.Contains("\\connecteddevicesplatform\\") || p.EndsWith("\\activitiescache.db")) return "ActivityHistory-Timeline";
-        if (p.Contains("\\packages\\") && p.Contains("\\settings\\settings.dat")) return "PackageSettingsHive";
-        if (p.EndsWith("\\usrclass.dat")) return "UsrClassDat-ShellbagsHive";
-        if (p.EndsWith("\\usrclass.dat.log1") || p.EndsWith("\\usrclass.dat.log2") || p.Contains("\\usrclass.dat") && p.EndsWith(".regtrans-ms"))
+        if (ContainsIgnoreCase(p, "\\appcompat\\pca\\")) return "AppCompat-PCA";
+        if (EndsWithIgnoreCase(p, "\\recentfilecache.bcf")) return "RecentFileCache";
+        if (ContainsIgnoreCase(p, "\\appcompat\\programs\\")) return "AppCompat-Execution";
+        if (ContainsIgnoreCase(p, "\\apppatch\\")) return "SDB-AppPatch";
+        if (ContainsIgnoreCase(p, "\\microsoft\\network\\downloader\\qmgr")) return "BITS-Qmgr";
+        if (EndsWithIgnoreCase(p, "\\srudb.dat")) return "SRUM-NetworkAppUsage";
+        if (ContainsIgnoreCase(p, "\\system32\\tasks\\")) return "ScheduledTask";
+        if (ContainsIgnoreCase(p, "\\wbem\\repository\\")) return "WMIRepository";
+        if (ContainsIgnoreCase(p, "\\recent\\automaticdestinations\\")) return "JumpList-AutomaticDestinations";
+        if (ContainsIgnoreCase(p, "\\recent\\customdestinations\\")) return "JumpList-CustomDestinations";
+        if (ContainsIgnoreCase(p, "\\microsoft\\windows\\recent\\")) return "RecentFiles";
+        if (EndsWithIgnoreCase(p, "\\consolehost_history.txt")) return "PowerShellHistory";
+        if (ContainsIgnoreCase(p, "\\powershell\\transcripts\\") || ContainsIgnoreCase(p, "\\windowspowershell\\transcripts\\")) return "PowerShellTranscripts";
+        if (ContainsIgnoreCase(p, "\\connecteddevicesplatform\\") || EndsWithIgnoreCase(p, "\\activitiescache.db")) return "ActivityHistory-Timeline";
+        if (ContainsIgnoreCase(p, "\\packages\\") && ContainsIgnoreCase(p, "\\settings\\settings.dat")) return "PackageSettingsHive";
+        if (EndsWithIgnoreCase(p, "\\usrclass.dat")) return "UsrClassDat-ShellbagsHive";
+        if (EndsWithIgnoreCase(p, "\\usrclass.dat.log1") || EndsWithIgnoreCase(p, "\\usrclass.dat.log2") || ContainsIgnoreCase(p, "\\usrclass.dat") && EndsWithIgnoreCase(p, ".regtrans-ms"))
             return "UsrClassDat-TransactionLog";
-        if (p.EndsWith("\\ntuser.dat")) return "NTUSER-DAT";
-        if (p.EndsWith("\\ntuser.dat.log1") || p.EndsWith("\\ntuser.dat.log2") || p.Contains("\\ntuser.dat") && p.EndsWith(".regtrans-ms"))
+        if (EndsWithIgnoreCase(p, "\\ntuser.dat")) return "NTUSER-DAT";
+        if (EndsWithIgnoreCase(p, "\\ntuser.dat.log1") || EndsWithIgnoreCase(p, "\\ntuser.dat.log2") || ContainsIgnoreCase(p, "\\ntuser.dat") && EndsWithIgnoreCase(p, ".regtrans-ms"))
             return "NTUSER-DAT-TransactionLog";
-        if (p.Contains("\\microsoft\\windows\\explorer\\")) return "ExplorerCache-Thumbcache-Iconcache";
-        if (p.Contains("\\webcache\\")) return "WebCache";
-        if (p.Contains("\\inetcache\\")) return "INetCache";
-        if (p.Contains("\\crashdumps\\") || p.Contains("\\minidump\\")) return "CrashDumps";
-        if (p.Contains("\\windows defender\\support\\")) return "DefenderSupport";
-        if (p.Contains("\\windows defender\\scans\\history\\service\\detectionhistory\\")) return "DefenderDetectionHistory";
-        if (p.Contains("\\windows defender\\scans\\history\\results\\")) return "DefenderResults";
-        if (p.Contains("\\windows defender\\quarantine\\")) return "DefenderQuarantine";
-        if (p.Contains("\\logfiles\\firewall\\")) return "WindowsFirewall";
-        if (p.Contains("\\inf\\setupapi") && p.EndsWith(".log")) return "SetupAPI";
-        if (p.Contains("\\microsoft\\search\\data\\applications\\windows\\")) return "WindowsSearchIndex";
-        if (p.Contains("\\$recycle.bin\\")) return "RecycleBin";
-        if (p.Contains("\\bravesoftware\\brave-browser\\user data\\")) return "BrowserProfile-Brave";
-        if (p.Contains("\\opera software\\")) return "BrowserProfile-Opera";
-        if (p.Contains("\\vivaldi\\user data\\")) return "BrowserProfile-Vivaldi";
-        if (p.Contains("\\chromium\\user data\\")) return "BrowserProfile-Chromium";
-        if (p.Contains("\\zen\\profiles\\")) return "BrowserProfile-Zen";
-        if (p.Contains("\\thebrowsercompany.arc_") && p.Contains("\\arc\\user data\\")) return "BrowserProfile-Arc";
-        if (p.Contains("\\user data\\") && (p.Contains("\\chrome\\") || p.Contains("\\edge\\"))) return "BrowserProfile-ChromeEdge";
-        if (p.Contains("\\firefox\\profiles\\")) return "BrowserProfile-Firefox";
-        if (p.Contains("\\discord")) return "Discord";
-        if (p.Contains("\\slack\\")) return "Slack";
-        if (p.Contains("\\telegram desktop\\")) return "Telegram";
-        if (p.Contains("\\signal\\")) return "Signal";
-        if (p.Contains("\\onedrive\\logs\\") || p.Contains("\\onedrive\\settings\\")) return "OneDrive";
-        if (p.Contains("\\google\\drivefs\\")) return "GoogleDrive";
-        if (p.Contains("\\dropbox\\")) return "Dropbox";
-        if (p.Contains("\\terminal server client\\cache\\")) return "RDPCache";
-        if (p.EndsWith("\\default.rdp")) return "RDP-DefaultFile";
-        if (p.Contains("\\.ssh\\")) return "OpenSSH";
-        if (p.Contains("\\anydesk\\")) return "RemoteAdmin-AnyDesk";
-        if (p.Contains("\\teamviewer\\")) return "RemoteAdmin-TeamViewer";
-        if (p.Contains("\\screenconnect")) return "RemoteAdmin-ScreenConnect";
-        if (p.Contains("\\rustdesk\\")) return "RemoteAdmin-RustDesk";
-        if (p.Contains("\\splashtop\\")) return "RemoteAdmin-Splashtop";
-        if (p.Contains("\\realvnc\\") || p.Contains("\\ultravnc\\") || p.Contains("\\tightvnc\\")) return "RemoteAdmin-VNC";
-        if (p.EndsWith("\\winscp.ini")) return "WinSCP";
-        if (p.Contains("\\openvpn\\")) return "OpenVPN";
-        if (p.Contains("\\tailscale\\")) return "Tailscale";
-        if (p.EndsWith("\\rclone.conf")) return "RcloneConfig";
-        if (p.Contains("\\roblox\\logs\\")) return "RobloxLogs";
-        if (p.Contains("\\.minecraft\\logs\\")) return "MinecraftLogs";
-        if (p.Contains("\\windows\\temp\\") || p.Contains("\\appdata\\local\\temp\\")) return "Temp";
+        if (ContainsIgnoreCase(p, "\\microsoft\\windows\\explorer\\")) return "ExplorerCache-Thumbcache-Iconcache";
+        if (ContainsIgnoreCase(p, "\\webcache\\")) return "WebCache";
+        if (ContainsIgnoreCase(p, "\\inetcache\\")) return "INetCache";
+        if (ContainsIgnoreCase(p, "\\crashdumps\\") || ContainsIgnoreCase(p, "\\minidump\\")) return "CrashDumps";
+        if (ContainsIgnoreCase(p, "\\windows defender\\support\\")) return "DefenderSupport";
+        if (ContainsIgnoreCase(p, "\\windows defender\\scans\\history\\service\\detectionhistory\\")) return "DefenderDetectionHistory";
+        if (ContainsIgnoreCase(p, "\\windows defender\\scans\\history\\results\\")) return "DefenderResults";
+        if (ContainsIgnoreCase(p, "\\windows defender\\quarantine\\")) return "DefenderQuarantine";
+        if (ContainsIgnoreCase(p, "\\logfiles\\firewall\\")) return "WindowsFirewall";
+        if (ContainsIgnoreCase(p, "\\inf\\setupapi") && EndsWithIgnoreCase(p, ".log")) return "SetupAPI";
+        if (ContainsIgnoreCase(p, "\\microsoft\\search\\data\\applications\\windows\\")) return "WindowsSearchIndex";
+        if (ContainsIgnoreCase(p, "\\$recycle.bin\\")) return "RecycleBin";
+        if (ContainsIgnoreCase(p, "\\bravesoftware\\brave-browser\\user data\\")) return "BrowserProfile-Brave";
+        if (ContainsIgnoreCase(p, "\\opera software\\")) return "BrowserProfile-Opera";
+        if (ContainsIgnoreCase(p, "\\vivaldi\\user data\\")) return "BrowserProfile-Vivaldi";
+        if (ContainsIgnoreCase(p, "\\chromium\\user data\\")) return "BrowserProfile-Chromium";
+        if (ContainsIgnoreCase(p, "\\zen\\profiles\\")) return "BrowserProfile-Zen";
+        if (ContainsIgnoreCase(p, "\\thebrowsercompany.arc_") && ContainsIgnoreCase(p, "\\arc\\user data\\")) return "BrowserProfile-Arc";
+        if (ContainsIgnoreCase(p, "\\user data\\") && (ContainsIgnoreCase(p, "\\chrome\\") || ContainsIgnoreCase(p, "\\edge\\"))) return "BrowserProfile-ChromeEdge";
+        if (ContainsIgnoreCase(p, "\\firefox\\profiles\\")) return "BrowserProfile-Firefox";
+        if (ContainsIgnoreCase(p, "\\discord")) return "Discord";
+        if (ContainsIgnoreCase(p, "\\slack\\")) return "Slack";
+        if (ContainsIgnoreCase(p, "\\telegram desktop\\")) return "Telegram";
+        if (ContainsIgnoreCase(p, "\\signal\\")) return "Signal";
+        if (ContainsIgnoreCase(p, "\\onedrive\\logs\\") || ContainsIgnoreCase(p, "\\onedrive\\settings\\")) return "OneDrive";
+        if (ContainsIgnoreCase(p, "\\google\\drivefs\\")) return "GoogleDrive";
+        if (ContainsIgnoreCase(p, "\\dropbox\\")) return "Dropbox";
+        if (ContainsIgnoreCase(p, "\\terminal server client\\cache\\")) return "RDPCache";
+        if (EndsWithIgnoreCase(p, "\\default.rdp")) return "RDP-DefaultFile";
+        if (ContainsIgnoreCase(p, "\\.ssh\\")) return "OpenSSH";
+        if (ContainsIgnoreCase(p, "\\anydesk\\")) return "RemoteAdmin-AnyDesk";
+        if (ContainsIgnoreCase(p, "\\teamviewer\\")) return "RemoteAdmin-TeamViewer";
+        if (ContainsIgnoreCase(p, "\\screenconnect")) return "RemoteAdmin-ScreenConnect";
+        if (ContainsIgnoreCase(p, "\\rustdesk\\")) return "RemoteAdmin-RustDesk";
+        if (ContainsIgnoreCase(p, "\\splashtop\\")) return "RemoteAdmin-Splashtop";
+        if (ContainsIgnoreCase(p, "\\realvnc\\") || ContainsIgnoreCase(p, "\\ultravnc\\") || ContainsIgnoreCase(p, "\\tightvnc\\")) return "RemoteAdmin-VNC";
+        if (EndsWithIgnoreCase(p, "\\winscp.ini")) return "WinSCP";
+        if (ContainsIgnoreCase(p, "\\openvpn\\")) return "OpenVPN";
+        if (ContainsIgnoreCase(p, "\\tailscale\\")) return "Tailscale";
+        if (EndsWithIgnoreCase(p, "\\rclone.conf")) return "RcloneConfig";
+        if (ContainsIgnoreCase(p, "\\roblox\\logs\\")) return "RobloxLogs";
+        if (ContainsIgnoreCase(p, "\\.minecraft\\logs\\")) return "MinecraftLogs";
+        if (ContainsIgnoreCase(p, "\\windows\\temp\\") || ContainsIgnoreCase(p, "\\appdata\\local\\temp\\")) return "Temp";
         return "";
     }
 
     public static string ClassifyRegistryPath(string path)
     {
-        string p = path.ToLowerInvariant();
-        if (p.Contains("\\software\\classes\\local settings\\software\\microsoft\\windows\\shell\\bagmru") ||
-            p.Contains("\\software\\classes\\local settings\\software\\microsoft\\windows\\shell\\bags"))
+        if (ContainsIgnoreCase(path, "\\software\\classes\\local settings\\software\\microsoft\\windows\\shell\\bagmru") ||
+            ContainsIgnoreCase(path, "\\software\\classes\\local settings\\software\\microsoft\\windows\\shell\\bags"))
             return "Shellbags";
-        if (p.Contains("\\software\\microsoft\\windows\\currentversion\\explorer\\userassist"))
+        if (ContainsIgnoreCase(path, "\\software\\microsoft\\windows\\currentversion\\explorer\\userassist"))
             return "UserAssist-Execution";
-        if (p.Contains("\\software\\microsoft\\windows\\currentversion\\explorer\\runmru"))
+        if (ContainsIgnoreCase(path, "\\software\\microsoft\\windows\\currentversion\\explorer\\runmru"))
             return "RunMRU";
-        if (p.Contains("\\software\\microsoft\\windows\\currentversion\\explorer\\recentdocs"))
+        if (ContainsIgnoreCase(path, "\\software\\microsoft\\windows\\currentversion\\explorer\\recentdocs"))
             return "RecentDocs";
-        if (p.Contains("\\software\\microsoft\\windows\\currentversion\\explorer\\typedpaths"))
+        if (ContainsIgnoreCase(path, "\\software\\microsoft\\windows\\currentversion\\explorer\\typedpaths"))
             return "TypedPaths";
-        if (p.Contains("\\software\\microsoft\\windows\\currentversion\\explorer\\comdlg32\\opensavepidlmru"))
+        if (ContainsIgnoreCase(path, "\\software\\microsoft\\windows\\currentversion\\explorer\\comdlg32\\opensavepidlmru"))
             return "OpenSavePidlMRU";
-        if (p.Contains("\\software\\classes\\local settings\\software\\microsoft\\windows\\shell\\muicache"))
+        if (ContainsIgnoreCase(path, "\\software\\classes\\local settings\\software\\microsoft\\windows\\shell\\muicache"))
             return "MUICache";
-        if (p.Contains("\\software\\microsoft\\windows nt\\currentversion\\appcompatflags"))
+        if (ContainsIgnoreCase(path, "\\software\\microsoft\\windows nt\\currentversion\\appcompatflags"))
             return "AppCompatFlags";
-        if (p.Contains("\\system\\currentcontrolset\\services\\bam") ||
-            p.Contains("\\system\\currentcontrolset\\services\\dam"))
+        if (ContainsIgnoreCase(path, "\\system\\currentcontrolset\\services\\bam") ||
+            ContainsIgnoreCase(path, "\\system\\currentcontrolset\\services\\dam"))
             return "BAM-DAM-Execution";
-        if (p.Contains("\\system\\currentcontrolset\\control\\session manager\\appcompatcache"))
+        if (ContainsIgnoreCase(path, "\\system\\currentcontrolset\\control\\session manager\\appcompatcache"))
             return "ShimCache-AppCompatCache";
-        if (p.Contains("\\software\\microsoft\\windows\\currentversion\\run"))
+        if (ContainsIgnoreCase(path, "\\software\\microsoft\\windows\\currentversion\\run"))
             return "RunKey-Persistence";
-        if (p.Contains("\\system\\currentcontrolset\\services"))
+        if (ContainsIgnoreCase(path, "\\system\\currentcontrolset\\services"))
             return "Services-Drivers";
-        if (p.Contains("\\software\\microsoft\\windows\\currentversion\\uninstall"))
+        if (ContainsIgnoreCase(path, "\\software\\microsoft\\windows\\currentversion\\uninstall"))
             return "Uninstall-InstalledPrograms";
-        if (p.Contains("\\software\\microsoft\\windows\\currentversion\\explorer\\mountpoints2"))
+        if (ContainsIgnoreCase(path, "\\software\\microsoft\\windows\\currentversion\\explorer\\mountpoints2"))
             return "MountPoints2";
-        if (p.Contains("\\system\\mounteddevices"))
+        if (ContainsIgnoreCase(path, "\\system\\mounteddevices"))
             return "MountedDevices";
-        if (p.Contains("\\enum\\usbstor"))
+        if (ContainsIgnoreCase(path, "\\enum\\usbstor"))
             return "USBSTOR";
-        if (p.Contains("\\software\\microsoft\\windows\\currentversion\\explorer\\fileexts"))
+        if (ContainsIgnoreCase(path, "\\software\\microsoft\\windows\\currentversion\\explorer\\fileexts"))
             return "FileExts-OpenWith";
-        if (p.Contains("\\software\\microsoft\\windows\\shell\\bags") ||
-            p.Contains("\\software\\microsoft\\windows\\shell\\bagmru"))
+        if (ContainsIgnoreCase(path, "\\software\\microsoft\\windows\\shell\\bags") ||
+            ContainsIgnoreCase(path, "\\software\\microsoft\\windows\\shell\\bagmru"))
             return "Shellbags";
-        if (p.Contains("\\software\\microsoft\\command processor"))
+        if (ContainsIgnoreCase(path, "\\software\\microsoft\\command processor"))
             return "CommandProcessor";
-        if (p.Contains("\\software\\microsoft\\powershell"))
+        if (ContainsIgnoreCase(path, "\\software\\microsoft\\powershell"))
             return "PowerShell";
-        if (p.Contains("\\software\\openssh"))
+        if (ContainsIgnoreCase(path, "\\software\\openssh"))
             return "OpenSSH";
-        if (p.Contains("\\software\\microsoft\\windows defender\\exclusions"))
+        if (ContainsIgnoreCase(path, "\\software\\microsoft\\windows defender\\exclusions"))
             return "DefenderExclusions";
-        if (p.Contains("\\software\\microsoft\\windows nt\\currentversion\\image file execution options"))
+        if (ContainsIgnoreCase(path, "\\software\\microsoft\\windows nt\\currentversion\\image file execution options"))
             return "IFEO";
-        if (p.Contains("\\software\\microsoft\\terminal server client"))
+        if (ContainsIgnoreCase(path, "\\software\\microsoft\\terminal server client"))
             return "RDP-TerminalServerClient";
-        if (p.Contains("\\software\\classes\\applications"))
+        if (ContainsIgnoreCase(path, "\\software\\classes\\applications"))
             return "RegisteredApplications";
-        if (p.Contains("\\software\\microsoft\\windows\\currentversion\\app paths"))
+        if (ContainsIgnoreCase(path, "\\software\\microsoft\\windows\\currentversion\\app paths"))
             return "AppPaths";
-        if (p.Contains("\\software\\microsoft\\windows\\currentversion\\internet settings\\zonemap"))
+        if (ContainsIgnoreCase(path, "\\software\\microsoft\\windows\\currentversion\\internet settings\\zonemap"))
             return "InternetSettings-ZoneMap";
-        if (p.Contains("\\software\\microsoft\\windows\\currentversion\\policies"))
+        if (ContainsIgnoreCase(path, "\\software\\microsoft\\windows\\currentversion\\policies"))
             return "WindowsPolicies";
         return "";
     }
+
+    private static string NormalizePathSeparators(string path) =>
+        path.IndexOf('/') >= 0 ? path.Replace('/', '\\') : path;
+
+    private static bool ContainsIgnoreCase(string value, string fragment) =>
+        value.Contains(fragment, StringComparison.OrdinalIgnoreCase);
+
+    private static bool EndsWithIgnoreCase(string value, string suffix) =>
+        value.EndsWith(suffix, StringComparison.OrdinalIgnoreCase);
 
     private static bool IsSystemHivePath(string path)
     {
@@ -472,7 +480,12 @@ internal static class ArtifactCatalog
             file = file.Split('.')[0];
         }
 
-        return file is "system" or "software" or "sam" or "security" or "default" or "components";
+        return file.Equals("system", StringComparison.OrdinalIgnoreCase) ||
+               file.Equals("software", StringComparison.OrdinalIgnoreCase) ||
+               file.Equals("sam", StringComparison.OrdinalIgnoreCase) ||
+               file.Equals("security", StringComparison.OrdinalIgnoreCase) ||
+               file.Equals("default", StringComparison.OrdinalIgnoreCase) ||
+               file.Equals("components", StringComparison.OrdinalIgnoreCase);
     }
 
     internal sealed class ArtifactCatalogEnvironment

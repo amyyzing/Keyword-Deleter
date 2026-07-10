@@ -4,23 +4,26 @@ internal sealed class KeywordMatcher
 {
     private readonly AhoCorasick _byteMatcher;
     private readonly AhoCorasick _textMatcher;
+    private readonly SearchValues<byte>? _byteStartAnchors;
 
     public PreparedKeyword[] Keywords { get; }
     public bool HasBytePatterns => _byteMatcher.HasPatterns;
     public int ByteSearchableKeywordCount { get; }
 
-    private KeywordMatcher(PreparedKeyword[] k, AhoCorasick bm, AhoCorasick tm, int byteSearchableKeywordCount)
+    private KeywordMatcher(PreparedKeyword[] k, AhoCorasick bm, AhoCorasick tm, int byteSearchableKeywordCount, SearchValues<byte>? byteStartAnchors)
     {
         Keywords = k;
         _byteMatcher = bm;
         _textMatcher = tm;
         ByteSearchableKeywordCount = byteSearchableKeywordCount;
+        _byteStartAnchors = byteStartAnchors;
     }
 
     public static KeywordMatcher Build(PreparedKeyword[] k)
     {
         var bm = new AhoCorasick();
         var tm = new AhoCorasick();
+        var byteStartAnchors = new HashSet<byte>();
         int byteSearchableKeywordCount = 0;
 
         foreach (var kw in k)
@@ -35,30 +38,46 @@ internal sealed class KeywordMatcher
             bm.Add(kw.UpperUtf8.Select(b => (int)b), new AhoOutput(kw, kw.UpperUtf8.Length, BytePatternKind.AsciiOrUtf8));
             bm.Add(ToUtf16Pattern(kw.UpperUtf8, true), new AhoOutput(kw, kw.UpperUtf8.Length * 2, BytePatternKind.Utf16LittleEndian));
             bm.Add(ToUtf16Pattern(kw.UpperUtf8, false), new AhoOutput(kw, kw.UpperUtf8.Length * 2, BytePatternKind.Utf16BigEndian));
+
+            if (kw.UpperUtf8.Length > 0)
+            {
+                AddAnchorVariants(byteStartAnchors, kw.UpperUtf8[0]);
+                byteStartAnchors.Add(0);
+            }
         }
 
         bm.Build(true);
         tm.Build(false);
-        return new KeywordMatcher(k, bm, tm, byteSearchableKeywordCount);
+        SearchValues<byte>? anchors = byteStartAnchors.Count is > 0 and < 192
+            ? SearchValues.Create(byteStartAnchors.ToArray())
+            : null;
+        return new KeywordMatcher(k, bm, tm, byteSearchableKeywordCount, anchors);
     }
 
     public void SearchBytesUnique(
         ReadOnlyMemory<byte> data,
         ref int state,
-        bool[] keywordAlreadyFound,
+        KeywordHitTracker keywordHits,
         ref int remainingKeywords,
         Func<ByteSearchHit, bool> onNewKeyword)
     {
         if (data.Length == 0 || remainingKeywords <= 0 || !_byteMatcher.HasPatterns)
             return;
 
-        _byteMatcher.SearchBytesUnique(data.Span, ref state, keywordAlreadyFound, ref remainingKeywords, onNewKeyword);
+        if (state == 0 && _byteStartAnchors != null && data.Span.IndexOfAny(_byteStartAnchors) < 0)
+            return;
+
+        _byteMatcher.SearchBytesUnique(data.Span, ref state, keywordHits, ref remainingKeywords, onNewKeyword);
     }
 
-    public IEnumerable<TextSearchHit> SearchDecodedText(string text) =>
-        _textMatcher.HasPatterns
-            ? _textMatcher.SearchText(text).Select(m => new TextSearchHit(m.Output.Keyword, m.StartIndex, m.Output.PatternLength))
-            : Enumerable.Empty<TextSearchHit>();
+    public IEnumerable<TextSearchHit> SearchDecodedText(string text)
+    {
+        if (!_textMatcher.HasPatterns)
+            yield break;
+
+        foreach (var match in _textMatcher.SearchText(text))
+            yield return new TextSearchHit(match.Output.Keyword, match.StartIndex, match.Output.PatternLength);
+    }
 
     private static int[] ToUtf16Pattern(byte[] a, bool le)
     {
@@ -80,10 +99,22 @@ internal sealed class KeywordMatcher
         return p;
     }
 
+    private static void AddAnchorVariants(HashSet<byte> anchors, byte b)
+    {
+        byte upper = ByteMatcher.UpperAscii(b);
+        anchors.Add(upper);
+
+        if (upper is >= (byte)'A' and <= (byte)'Z')
+            anchors.Add((byte)(upper + 32));
+        else
+            anchors.Add(b);
+    }
+
     private sealed class AhoCorasick
     {
         private readonly List<Node> _nodes = new() { new Node() };
         private int[]? _byteTransitionsFlat;
+        private int[]? _asciiTransitionsFlat;
         private bool _built;
 
         public bool HasPatterns { get; private set; }
@@ -135,7 +166,10 @@ internal sealed class KeywordMatcher
                 }
             }
 
-            if (fullByte) BuildByteTransitions();
+            if (fullByte)
+                BuildByteTransitions();
+            else
+                BuildAsciiTransitions();
         }
 
         private void BuildByteTransitions()
@@ -158,10 +192,30 @@ internal sealed class KeywordMatcher
             }
         }
 
+        private void BuildAsciiTransitions()
+        {
+            _asciiTransitionsFlat = new int[_nodes.Count * 128];
+
+            for (int i = 0; i < _nodes.Count; i++)
+            {
+                int row = i << 7;
+                for (int c = 0; c < 128; c++)
+                {
+                    int folded = c is >= 'a' and <= 'z' ? c - 32 : c;
+                    int state = i;
+
+                    while (state != 0 && !_nodes[state].Next.ContainsKey(folded))
+                        state = _nodes[state].Fail;
+
+                    _asciiTransitionsFlat[row + c] = _nodes[state].Next.TryGetValue(folded, out int n) ? n : 0;
+                }
+            }
+        }
+
         public void SearchBytesUnique(
             ReadOnlySpan<byte> data,
             ref int state,
-            bool[] keywordAlreadyFound,
+            KeywordHitTracker keywordHits,
             ref int remainingKeywords,
             Func<ByteSearchHit, bool> onNewKeyword)
         {
@@ -177,10 +231,9 @@ internal sealed class KeywordMatcher
                 {
                     var o = outputs[j];
                     int idx = o.Keyword.Index;
-                    if ((uint)idx >= (uint)keywordAlreadyFound.Length || keywordAlreadyFound[idx])
+                    if (!keywordHits.MarkIfNew(idx))
                         continue;
 
-                    keywordAlreadyFound[idx] = true;
                     remainingKeywords--;
 
                     var hit = new ByteSearchHit(o.Keyword, i - o.PatternLength + 1, o.ByteKind, o.PatternLength);
@@ -195,13 +248,30 @@ internal sealed class KeywordMatcher
 
         public IEnumerable<AhoMatch> SearchText(string text)
         {
+            var asciiTransitions = _asciiTransitionsFlat;
             int state = 0;
             for (int i = 0; i < text.Length; i++)
             {
-                int sym = char.ToUpperInvariant(text[i]);
-                while (state != 0 && !_nodes[state].Next.ContainsKey(sym)) state = _nodes[state].Fail;
-                state = _nodes[state].Next.TryGetValue(sym, out int next) ? next : 0;
-                foreach (var o in _nodes[state].Outputs) yield return new AhoMatch(o, i - o.PatternLength + 1);
+                char c = text[i];
+                if (c < 128 && asciiTransitions != null)
+                {
+                    state = asciiTransitions[(state << 7) + c];
+                }
+                else
+                {
+                    int sym = char.ToUpperInvariant(c);
+                    while (state != 0 && !_nodes[state].Next.ContainsKey(sym))
+                        state = _nodes[state].Fail;
+
+                    state = _nodes[state].Next.TryGetValue(sym, out int next) ? next : 0;
+                }
+
+                var outputs = _nodes[state].Outputs;
+                for (int j = 0; j < outputs.Count; j++)
+                {
+                    var output = outputs[j];
+                    yield return new AhoMatch(output, i - output.PatternLength + 1);
+                }
             }
         }
 

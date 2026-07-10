@@ -32,7 +32,7 @@ internal sealed class RegistryKeywordScanner
                 try
                 {
                     using var baseKey = RegistryKey.OpenBaseKey(root.Hive, root.View);
-                    var binarySeen = new bool[_matcher.Keywords.Length];
+                    var binarySeen = new KeywordHitTracker(_matcher.Keywords.Length);
                     ScanKey(baseKey, root.Display, root.SubKey, token, binarySeen);
                 }
                 catch (OperationCanceledException) { }
@@ -42,7 +42,7 @@ internal sealed class RegistryKeywordScanner
             }).ConfigureAwait(false);
     }
 
-    private void ScanKey(RegistryKey baseKey, string displayRoot, string sub, CancellationToken ct, bool[] binarySeen)
+    private void ScanKey(RegistryKey baseKey, string displayRoot, string sub, CancellationToken ct, KeywordHitTracker binarySeen)
     {
         RegistryKey? key = null;
         try
@@ -86,7 +86,7 @@ internal sealed class RegistryKeywordScanner
 
                 if (val is byte[] bin && bin.Length > 0 && _matcher.HasBytePatterns)
                 {
-                    Array.Clear(binarySeen, 0, binarySeen.Length);
+                    binarySeen.Reset();
                     int remaining = _matcher.ByteSearchableKeywordCount;
                     int state = 0;
 

@@ -27,8 +27,9 @@ internal sealed class FileKeywordScanner
     private const int DefaultReadWorkers = 16;
     private const int DefaultMaxReadsPerVolume = 8;
     private const int DefaultReadBufferBytes = 4 * 1024 * 1024;
+    private const int DirQueuePerEnumWorker = 512;
     private const int FileQueuePerReader = 1024;
-    private const int ParseQueuePerWorker = 16;
+    private const int ParseQueuePerWorker = 2;
     private const int ParserPrefixBytes = 8 * 1024 * 1024;
     private const long DefaultMaxContentScanBytes = 256L * 1024 * 1024;
     private const int MaxArchiveEntries = 300;
@@ -80,18 +81,22 @@ internal sealed class FileKeywordScanner
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(token, _matchToken);
         var ct = linked.Token;
 
-        _dirChannel = Channel.CreateUnbounded<DirJob>();
+        _dirChannel = Channel.CreateBounded<DirJob>(
+            new BoundedChannelOptions(Math.Max(1024, _enumWorkers * DirQueuePerEnumWorker))
+            {
+                FullMode = BoundedChannelFullMode.Wait
+            });
         _fileChannel = Channel.CreateBounded<FileJob>(
             new BoundedChannelOptions(Math.Max(8192, _readWorkers * FileQueuePerReader))
             {
                 FullMode = BoundedChannelFullMode.Wait
             });
         _parseChannel = Channel.CreateBounded<ParseJob>(
-            new BoundedChannelOptions(Math.Max(16, _parserWorkers * ParseQueuePerWorker))
+            new BoundedChannelOptions(Math.Max(8, _parserWorkers * ParseQueuePerWorker))
             {
                 FullMode = BoundedChannelFullMode.Wait
             });
-        _pendingDirs = 0;
+        _pendingDirs = 1;
 
         var readTasks = Enumerable.Range(0, _readWorkers).Select(_ => ReadWorker(ct)).ToArray();
         var enumTasks = Enumerable.Range(0, _enumWorkers).Select(_ => EnumWorker(ct)).ToArray();
@@ -111,7 +116,7 @@ internal sealed class FileKeywordScanner
                 else if (Directory.Exists(root.Path))
                 {
                     if (!IsExcluded(root.Path))
-                        EnqueueDir(new DirJob(root.Path, root.Path, source, root.CleanupEligible));
+                        await EnqueueDirAsync(new DirJob(root.Path, root.Path, source, root.CleanupEligible), ct).ConfigureAwait(false);
                 }
                 else if (File.Exists(root.Path) || IsSpecialFileRoot(root.Path))
                 {
@@ -122,7 +127,7 @@ internal sealed class FileKeywordScanner
             catch (OperationCanceledException) { break; }
             catch (Exception ex) { ScannerDiagnostics.Error($"Error enqueueing root {root.Path}: {ex.Message}"); }
         }
-        if (Volatile.Read(ref _pendingDirs) == 0) _dirChannel.Writer.TryComplete();
+        if (Interlocked.Decrement(ref _pendingDirs) == 0) _dirChannel.Writer.TryComplete();
 
         try { await Task.WhenAll(enumTasks).ConfigureAwait(false); } catch (OperationCanceledException) { }
         _fileChannel.Writer.TryComplete();
@@ -131,7 +136,21 @@ internal sealed class FileKeywordScanner
         try { await Task.WhenAll(parseTasks).ConfigureAwait(false); } catch (OperationCanceledException) { }
     }
 
-    private void EnqueueDir(DirJob job) { Interlocked.Increment(ref _pendingDirs); _dirChannel.Writer.TryWrite(job); }
+    private async ValueTask EnqueueDirAsync(DirJob job, CancellationToken ct)
+    {
+        Interlocked.Increment(ref _pendingDirs);
+        try
+        {
+            await _dirChannel.Writer.WriteAsync(job, ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            if (Interlocked.Decrement(ref _pendingDirs) == 0)
+                _dirChannel.Writer.TryComplete();
+
+            throw;
+        }
+    }
 
     private async Task EnumWorker(CancellationToken ct)
     {
@@ -149,50 +168,99 @@ internal sealed class FileKeywordScanner
         catch (OperationCanceledException) { }
     }
 
-    private async Task ProcessDirectoryAsync(DirJob job, CancellationToken ct)
+    private async Task ProcessDirectoryAsync(DirJob firstJob, CancellationToken ct)
     {
-        if (IsExcluded(job.Path)) return;
-        if (!_seenDirs.TryAdd(job.Path, 0)) return;
-        try { if ((File.GetAttributes(job.Path) & FileAttributes.ReparsePoint) != 0) return; } catch { return; }
-
-        bool directoryMatched =
-            CheckText(job.Source, "DIRECTORY-NAME", job.Path, PathUtil.FileName(job.Path), job.CleanupEligible) |
-            CheckText(job.Source, "DIRECTORY-PATH", job.Path, job.Path, job.CleanupEligible);
-
-        if (_pruneMatchedDirectories && directoryMatched)
-            return;
-
-        var opts = new EnumerationOptions
+        var inlineJobs = new Stack<DirJob>();
+        inlineJobs.Push(firstJob);
+        var options = new EnumerationOptions
         {
             IgnoreInaccessible = true,
             RecurseSubdirectories = false,
             AttributesToSkip = FileAttributes.ReparsePoint
         };
 
-        try
+        while (inlineJobs.TryPop(out var job))
         {
-            foreach (var fsi in new DirectoryInfo(job.Path).EnumerateFileSystemInfos("*", opts))
+            if (ct.IsCancellationRequested)
+                return;
+
+            if (IsExcluded(job.Path) || !_seenDirs.TryAdd(job.Path, 0))
+                continue;
+
+            try
             {
-                if (ct.IsCancellationRequested) return;
-                string p = fsi.FullName;
-                if (IsExcluded(p)) continue;
-                string source = ClassifyOrSource(job.Source, p);
-                if ((fsi.Attributes & FileAttributes.Directory) != 0)
-                    EnqueueDir(new DirJob(p, job.Root, source, job.CleanupEligible));
-                else
-                    await _fileChannel.Writer.WriteAsync(new FileJob(p, job.Root, source, job.CleanupEligible), ct).ConfigureAwait(false);
+                if ((File.GetAttributes(job.Path) & FileAttributes.ReparsePoint) != 0)
+                    continue;
+            }
+            catch
+            {
+                continue;
+            }
+
+            bool directoryMatched =
+                CheckText(job.Source, "DIRECTORY-NAME", job.Path, PathUtil.FileName(job.Path), job.CleanupEligible) |
+                CheckText(job.Source, "DIRECTORY-PATH", job.Path, job.Path, job.CleanupEligible);
+
+            if (_pruneMatchedDirectories && directoryMatched)
+                continue;
+
+            try
+            {
+                foreach (var fsi in new DirectoryInfo(job.Path).EnumerateFileSystemInfos("*", options))
+                {
+                    if (ct.IsCancellationRequested)
+                        return;
+
+                    string path = fsi.FullName;
+                    if (IsExcluded(path))
+                        continue;
+
+                    string source = ClassifyOrSource(job.Source, path);
+                    if ((fsi.Attributes & FileAttributes.Directory) != 0)
+                    {
+                        var childJob = new DirJob(path, job.Root, source, job.CleanupEligible);
+                        if (!TryQueueDir(childJob))
+                            inlineJobs.Push(childJob);
+                    }
+                    else
+                    {
+                        long length = -1;
+                        try
+                        {
+                            if (fsi is FileInfo fileInfo)
+                                length = Math.Max(0, fileInfo.Length);
+                        }
+                        catch { }
+
+                        await _fileChannel.Writer.WriteAsync(
+                            new FileJob(path, job.Root, source, job.CleanupEligible, length),
+                            ct).ConfigureAwait(false);
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                ScannerDiagnostics.Error($"Enumeration error in {job.Path}: {ex.Message}");
             }
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            ScannerDiagnostics.Error($"Enumeration error in {job.Path}: {ex.Message}");
-        }
+    }
+
+    private bool TryQueueDir(DirJob job)
+    {
+        Interlocked.Increment(ref _pendingDirs);
+        if (_dirChannel.Writer.TryWrite(job))
+            return true;
+
+        if (Interlocked.Decrement(ref _pendingDirs) == 0)
+            _dirChannel.Writer.TryComplete();
+
+        return false;
     }
 
     private async Task ReadWorker(CancellationToken ct)
     {
         byte[] buffer = ArrayPool<byte>.Shared.Rent(_readBufferBytes);
-        bool[] contentHits = new bool[_matcher.Keywords.Length];
+        var contentHits = new KeywordHitTracker(_matcher.Keywords.Length);
 
         try
         {
@@ -200,7 +268,7 @@ internal sealed class FileKeywordScanner
             {
                 if (ct.IsCancellationRequested) break;
 
-                Array.Clear(contentHits, 0, contentHits.Length);
+                contentHits.Reset();
 
                 try { await ProcessFileAsync(job, ct, buffer, contentHits).ConfigureAwait(false); }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
@@ -242,7 +310,7 @@ internal sealed class FileKeywordScanner
         catch (OperationCanceledException) { }
     }
 
-    private async Task ProcessFileAsync(FileJob job, CancellationToken ct, byte[] buffer, bool[] contentHitsForFile)
+    private async Task ProcessFileAsync(FileJob job, CancellationToken ct, byte[] buffer, KeywordHitTracker contentHitsForFile)
     {
         if (IsExcluded(job.Path)) return;
         if (!_seenFiles.TryAdd(job.Path, 0)) return;
@@ -254,18 +322,31 @@ internal sealed class FileKeywordScanner
         CheckText(source, "FILE-PATH", path, path, job.CleanupEligible);
 
         FileInfo? info = null;
-        long fileSize = 0;
-        try
+        long fileSize = job.Length;
+        if (fileSize < 0)
         {
-            info = new FileInfo(path);
-            fileSize = Math.Max(0, info.Length);
+            try
+            {
+                info = new FileInfo(path);
+                fileSize = Math.Max(0, info.Length);
+            }
+            catch
+            {
+                fileSize = 0;
+            }
         }
-        catch { }
+
+        bool archiveCandidate = ForensicParserEngine.IsZipLikePath(path);
+        if (archiveCandidate)
+        {
+            await ScanArchiveEntriesAsync(job, buffer, contentHitsForFile, ct).ConfigureAwait(false);
+            return;
+        }
 
         bool parserCandidateByPath = ForensicParserEngine.MightParseByPath(path, info);
-        bool archiveCandidate = ForensicParserEngine.IsZipLikePath(path);
         bool rawContentAllowed = ShouldScanRawContent(path, info, fileSize);
-        if (!rawContentAllowed && !parserCandidateByPath && !archiveCandidate)
+
+        if (!rawContentAllowed && !parserCandidateByPath)
             return;
 
         byte[]? prefixBuffer = null;
@@ -365,16 +446,13 @@ internal sealed class FileKeywordScanner
                 finally { throttle.Release(); }
             }
 
-            if (!ct.IsCancellationRequested && prefixLength > 0 && prefixBuffer != null && File.Exists(path))
+            if (!ct.IsCancellationRequested && prefixLength > 0 && prefixBuffer != null)
             {
                 info ??= new FileInfo(path);
                 await _parseChannel.Writer.WriteAsync(new ParseJob(path, source, info, prefixBuffer, prefixLength, job.CleanupEligible), ct).ConfigureAwait(false);
                 prefixBuffer = null;
                 prefixLength = 0;
             }
-
-            if (!ct.IsCancellationRequested && archiveCandidate && File.Exists(path))
-                await ScanArchiveEntriesAsync(job, buffer, ct).ConfigureAwait(false);
         }
         finally
         {
@@ -383,7 +461,11 @@ internal sealed class FileKeywordScanner
         }
     }
 
-    private async Task ScanArchiveEntriesAsync(FileJob job, byte[] buffer, CancellationToken ct)
+    private async Task ScanArchiveEntriesAsync(
+        FileJob job,
+        byte[] buffer,
+        KeywordHitTracker entryHits,
+        CancellationToken ct)
     {
         try
         {
@@ -391,14 +473,13 @@ internal sealed class FileKeywordScanner
             using var archive = new System.IO.Compression.ZipArchive(fs, System.IO.Compression.ZipArchiveMode.Read, leaveOpen: false);
 
             int listed = 0;
-            var entryHits = new bool[_matcher.Keywords.Length];
             foreach (var entry in archive.Entries)
             {
                 if (ct.IsCancellationRequested)
                     return;
 
                 listed++;
-                if (listed > MaxArchiveEntries)
+                if (!_deepContentScan && listed > MaxArchiveEntries)
                     break;
 
                 CheckArchiveEntryName(job.Source, job.Path, entry.FullName, job.CleanupEligible);
@@ -409,7 +490,7 @@ internal sealed class FileKeywordScanner
                 if (!_deepContentScan && entry.Length > _maxContentScanBytes)
                     continue;
 
-                Array.Clear(entryHits, 0, entryHits.Length);
+                entryHits.Reset();
                 await ScanArchiveEntryContentAsync(job, entry, buffer, entryHits, ct).ConfigureAwait(false);
             }
         }
@@ -423,7 +504,7 @@ internal sealed class FileKeywordScanner
         FileJob job,
         System.IO.Compression.ZipArchiveEntry entry,
         byte[] buffer,
-        bool[] entryHits,
+        KeywordHitTracker entryHits,
         CancellationToken ct)
     {
         if (!_matcher.HasBytePatterns)

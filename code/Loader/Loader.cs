@@ -4,7 +4,7 @@ namespace Loader;
 
 internal static class Loader
 {
-    private static async Task<int> Main(string[] args)
+    private static async Task<int> Main()
     {
         if (!OperatingSystem.IsWindows())
         {
@@ -12,34 +12,15 @@ internal static class Loader
             return 1;
         }
 
-        if (args.Any(arg => arg.Equals("--help", StringComparison.OrdinalIgnoreCase)
-            || arg.Equals("-h", StringComparison.OrdinalIgnoreCase)
-            || arg.Equals("/?", StringComparison.OrdinalIgnoreCase)))
-        {
-            PrintUsage();
-            return 0;
-        }
-
         try
         {
-            var options = ParseArgs(args);
-
-            if (args.Any(arg => arg.Equals("--self-check", StringComparison.OrdinalIgnoreCase)))
-            {
-                await StartupSelfCheck.RunAsync().ConfigureAwait(false);
-                return 0;
-            }
-
-            if (!options.SkipSelfCheck)
-                await StartupSelfCheck.RunAsync().ConfigureAwait(false);
-
-            if (options.Keywords.Count == 0)
-                PromptForScan(options);
+            var options = CreateMaximumScanOptions();
+            await StartupSelfCheck.RunAsync().ConfigureAwait(false);
+            PromptForScan(options);
 
             if (options.Keywords.Count == 0)
             {
                 Console.Error.WriteLine("At least one keyword is required.");
-                PrintUsage();
                 return 1;
             }
 
@@ -55,120 +36,23 @@ internal static class Loader
         }
     }
 
-    private static ScanOptions ParseArgs(string[] args)
+    private static ScanOptions CreateMaximumScanOptions()
     {
-        var options = new ScanOptions
+        int processors = Math.Max(1, Environment.ProcessorCount);
+
+        return new ScanOptions
         {
             DeleteFound = false,
-            DeleteWithoutPrompt = false
+            DeepContentScan = true,
+            FullRegistryScan = true,
+            LowImpact = false,
+            DirectoryEnumWorkers = Math.Clamp(processors, 4, 16),
+            FileReadWorkers = Math.Clamp(processors * 2, 16, 64),
+            MaxReadsPerVolume = Math.Clamp(processors, 8, 24),
+            ParserWorkers = Math.Clamp(processors, 2, 16),
+            RegistryWorkers = 8,
+            ReadBufferBytes = 4 * 1024 * 1024
         };
-
-        for (int i = 0; i < args.Length; i++)
-        {
-            string arg = args[i];
-            if (arg.Equals("--kw", StringComparison.OrdinalIgnoreCase)
-                || arg.Equals("--keyword", StringComparison.OrdinalIgnoreCase))
-            {
-                options.Keywords.Add(RequireValue(args, ref i, arg));
-            }
-            else if (arg.Equals("--root", StringComparison.OrdinalIgnoreCase))
-            {
-                options.Roots.Add(RequireValue(args, ref i, arg));
-            }
-            else if (arg.Equals("--delete", StringComparison.OrdinalIgnoreCase))
-            {
-                options.DeleteFound = true;
-            }
-            else if (arg.Equals("--yes", StringComparison.OrdinalIgnoreCase))
-            {
-                options.DeleteWithoutPrompt = true;
-            }
-            else if (arg.Equals("--skip-elevation", StringComparison.OrdinalIgnoreCase))
-            {
-                options.SkipElevation = true;
-            }
-            else if (arg.Equals("--skip-self-check", StringComparison.OrdinalIgnoreCase))
-            {
-                options.SkipSelfCheck = true;
-            }
-            else if (arg.Equals("--self-check", StringComparison.OrdinalIgnoreCase))
-            {
-                options.SkipSelfCheck = true;
-            }
-            else if (arg.Equals("--skip-registry", StringComparison.OrdinalIgnoreCase))
-            {
-                options.SkipRegistry = true;
-            }
-            else if (arg.Equals("--full-registry-scan", StringComparison.OrdinalIgnoreCase))
-            {
-                options.FullRegistryScan = true;
-            }
-            else if (arg.Equals("--file-workers", StringComparison.OrdinalIgnoreCase))
-            {
-                options.FileReadWorkers = ReadPositiveInt(args, ref i, arg);
-            }
-            else if (arg.Equals("--enum-workers", StringComparison.OrdinalIgnoreCase))
-            {
-                options.DirectoryEnumWorkers = ReadPositiveInt(args, ref i, arg);
-            }
-            else if (arg.Equals("--reads-per-volume", StringComparison.OrdinalIgnoreCase))
-            {
-                options.MaxReadsPerVolume = ReadPositiveInt(args, ref i, arg);
-            }
-            else if (arg.Equals("--parser-workers", StringComparison.OrdinalIgnoreCase))
-            {
-                options.ParserWorkers = ReadPositiveInt(args, ref i, arg);
-            }
-            else if (arg.Equals("--registry-workers", StringComparison.OrdinalIgnoreCase))
-            {
-                options.RegistryWorkers = ReadPositiveInt(args, ref i, arg);
-            }
-            else if (arg.Equals("--buffer-mb", StringComparison.OrdinalIgnoreCase))
-            {
-                int megabytes = ReadPositiveInt(args, ref i, arg);
-                options.ReadBufferBytes = Math.Min(megabytes, 64) * 1024 * 1024;
-            }
-            else if (arg.Equals("--deep-content-scan", StringComparison.OrdinalIgnoreCase))
-            {
-                options.DeepContentScan = true;
-            }
-            else if (arg.Equals("--low-impact", StringComparison.OrdinalIgnoreCase))
-            {
-                options.LowImpact = true;
-            }
-            else if (arg.Equals("--max-content-mb", StringComparison.OrdinalIgnoreCase))
-            {
-                int megabytes = ReadPositiveInt(args, ref i, arg);
-                options.MaxContentScanBytes = Math.Min(megabytes, 16384L) * 1024L * 1024L;
-            }
-            else if (!arg.StartsWith("-", StringComparison.Ordinal))
-            {
-                options.Keywords.Add(arg);
-            }
-            else
-            {
-                throw new InvalidOperationException("Unknown option: " + arg);
-            }
-        }
-
-        return options;
-    }
-
-    private static string RequireValue(string[] args, ref int index, string option)
-    {
-        if (index + 1 >= args.Length)
-            throw new InvalidOperationException(option + " requires a value.");
-
-        return args[++index];
-    }
-
-    private static int ReadPositiveInt(string[] args, ref int index, string option)
-    {
-        string value = RequireValue(args, ref index, option);
-        if (!int.TryParse(value, out int parsed) || parsed <= 0)
-            throw new InvalidOperationException(option + " requires a positive integer.");
-
-        return parsed;
     }
 
     private static void PromptForScan(ScanOptions options)
@@ -221,24 +105,21 @@ internal static class Loader
         Console.WriteLine("Cleanup targets: " + targetCount);
 
         if (options.DeleteFound)
-            DeleteFindings(payload, targetCount, options.DeleteWithoutPrompt);
+            DeleteFindings(payload, targetCount);
     }
 
-    private static void DeleteFindings(ScanPayload payload, int targetCount, bool deleteWithoutPrompt)
+    private static void DeleteFindings(ScanPayload payload, int targetCount)
     {
         if (targetCount == 0)
             return;
 
-        if (!deleteWithoutPrompt)
+        Console.WriteLine();
+        Console.Write($"Type DELETE to delete {targetCount} target(s): ");
+        string? confirmation = Console.ReadLine();
+        if (!string.Equals(confirmation, "DELETE", StringComparison.Ordinal))
         {
-            Console.WriteLine();
-            Console.Write($"Type DELETE to delete {targetCount} target(s): ");
-            string? confirmation = Console.ReadLine();
-            if (!string.Equals(confirmation, "DELETE", StringComparison.Ordinal))
-            {
-                Console.WriteLine("Delete cancelled.");
-                return;
-            }
+            Console.WriteLine("Delete cancelled.");
+            return;
         }
 
         var result = FindingCleanupService.DeleteFindings(payload.Findings);
@@ -325,35 +206,4 @@ internal static class Loader
         return value.Trim().StartsWith("y", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static void PrintUsage()
-    {
-        Console.WriteLine("Loader Scanner");
-        Console.WriteLine();
-        Console.WriteLine("Usage:");
-        Console.WriteLine("  loader.exe --kw <keyword> [--delete] [--yes]");
-        Console.WriteLine("  loader.exe <keyword>");
-        Console.WriteLine();
-        Console.WriteLine("Options:");
-        Console.WriteLine("  --kw, --keyword <value>     Keyword to scan for. Can be used more than once.");
-        Console.WriteLine("  --root <path>               Scan an explicit file/folder root instead of all fixed drives.");
-        Console.WriteLine("  --delete                    Delete cleanup targets after review confirmation.");
-        Console.WriteLine("  --yes                       Skip DELETE confirmation when used with --delete.");
-        Console.WriteLine("  --skip-elevation            Do not request scanner privileges.");
-        Console.WriteLine("  --self-check                Run startup checks only, then exit.");
-        Console.WriteLine("  --skip-self-check           Start without running the startup self-check.");
-        Console.WriteLine("  --skip-registry             Skip registry scanning.");
-        Console.WriteLine("  --full-registry-scan        Scan whole registry hives instead of targeted artifact keys.");
-        Console.WriteLine("  --file-workers <count>      Override file read worker count.");
-        Console.WriteLine("  --enum-workers <count>      Override directory enumeration worker count.");
-        Console.WriteLine("  --reads-per-volume <count>  Override concurrent reads per volume.");
-        Console.WriteLine("  --parser-workers <count>    Override artifact parser worker count.");
-        Console.WriteLine("  --registry-workers <count>  Override registry root worker count.");
-        Console.WriteLine("  --buffer-mb <count>         Override per-reader buffer size in MiB.");
-        Console.WriteLine("  --max-content-mb <count>    Smart-mode max raw content bytes per file in MiB. Default: 256.");
-        Console.WriteLine("  --deep-content-scan         Read raw content from every file like the older scanner path.");
-        Console.WriteLine("  --low-impact                Use fewer workers and smaller buffers for weaker PCs or multitasking.");
-        Console.WriteLine("  --help                      Show this help.");
-        Console.WriteLine();
-        Console.WriteLine("Running without arguments starts an interactive command-prompt flow.");
-    }
 }

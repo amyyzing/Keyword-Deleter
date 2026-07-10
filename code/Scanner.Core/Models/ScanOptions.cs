@@ -8,7 +8,6 @@ public sealed class ScanOptions
     public bool StopOnFirstMatch { get; set; }
     public bool SkipElevation { get; set; }
     public bool DeleteFound { get; set; }
-    public bool DeleteWithoutPrompt { get; set; }
     public bool PruneMatchedDirectories { get; set; }
     public int? FileReadWorkers { get; set; }
     public int? DirectoryEnumWorkers { get; set; }
@@ -21,5 +20,4 @@ public sealed class ScanOptions
     public bool LowImpact { get; set; }
     public bool SkipRegistry { get; set; }
     public bool FullRegistryScan { get; set; }
-    public bool SkipSelfCheck { get; set; }
 }

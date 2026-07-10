@@ -66,9 +66,13 @@ internal static class Program
             };
             Assert(FindingCleanupService.CountTargets(findings) == 1, "Scan-only findings should not become cleanup targets.");
 
+            RunTextMatcherFastPathTest();
             RunSmallFileScan(root).GetAwaiter().GetResult();
+            RunMultipleRootScan(root).GetAwaiter().GetResult();
+            RunChunkBoundaryScan(root).GetAwaiter().GetResult();
             RunSmartContentGateScan(root).GetAwaiter().GetResult();
             RunArchiveEntryScan(root).GetAwaiter().GetResult();
+            RunDeepArchiveCoverageScan(root).GetAwaiter().GetResult();
             RunCleanupDeleteScan(root).GetAwaiter().GetResult();
 
             Console.WriteLine("Scanner.Core catalog tests passed.");
@@ -103,6 +107,23 @@ internal static class Program
             throw new InvalidOperationException(message);
     }
 
+    private static void RunTextMatcherFastPathTest()
+    {
+        var matcher = KeywordMatcher.Build(
+        [
+            PreparedKeyword.Prepare("mixed-case", 0),
+            PreparedKeyword.Prepare("caf\u00e9", 1)
+        ]);
+
+        var asciiHits = matcher.SearchDecodedText(@"C:\Temp\MIXED-CASE.txt").ToArray();
+        Assert(asciiHits.Any(hit => hit.Keyword.Index == 0),
+            "ASCII transition table should preserve case-insensitive path matching.");
+
+        var unicodeHits = matcher.SearchDecodedText("prefix CAF\u00c9 suffix").ToArray();
+        Assert(unicodeHits.Any(hit => hit.Keyword.Index == 1),
+            "ASCII transition table should fall back correctly for Unicode text.");
+    }
+
     private static async Task RunSmallFileScan(string root)
     {
         string scanRoot = Path.Combine(root, "ScanRoot");
@@ -128,6 +149,60 @@ internal static class Program
 
         Assert(results.Any(f => f.Location.EndsWith("sample.txt", StringComparison.OrdinalIgnoreCase)), "Small temp-root file scan should find sample.txt.");
         Assert(results.All(f => f.CleanupEligible), "Default explicit scan roots should remain cleanup-eligible.");
+    }
+
+    private static async Task RunMultipleRootScan(string root)
+    {
+        string firstRoot = Path.Combine(root, "MultiRootA");
+        string secondRoot = Path.Combine(root, "MultiRootB");
+        Touch(Path.Combine(firstRoot, "first-keyword.txt"));
+        Touch(Path.Combine(secondRoot, "second-keyword.txt"));
+
+        var service = new ScannerService();
+        var options = new ScanOptions
+        {
+            SkipElevation = true,
+            SkipRegistry = true,
+            DirectoryEnumWorkers = 2,
+            FileReadWorkers = 1,
+            ParserWorkers = 1,
+            ReadBufferBytes = 64 * 1024
+        };
+        options.Keywords.Add("first-keyword");
+        options.Keywords.Add("second-keyword");
+        options.Roots.Add(firstRoot);
+        options.Roots.Add(secondRoot);
+
+        var payload = await service.RunAsync(options);
+        Assert(payload.Findings.Any(f => f.Location.EndsWith("first-keyword.txt", StringComparison.OrdinalIgnoreCase)),
+            "Bounded directory queue should scan the first explicit root.");
+        Assert(payload.Findings.Any(f => f.Location.EndsWith("second-keyword.txt", StringComparison.OrdinalIgnoreCase)),
+            "Bounded directory queue should scan the second explicit root.");
+    }
+
+    private static async Task RunChunkBoundaryScan(string root)
+    {
+        string scanRoot = Path.Combine(root, "ChunkBoundary");
+        Directory.CreateDirectory(scanRoot);
+        string file = Path.Combine(scanRoot, "boundary.txt");
+        File.WriteAllText(file, new string('x', (64 * 1024) - 2) + "boundary-keyword");
+
+        var service = new ScannerService();
+        var options = new ScanOptions
+        {
+            SkipElevation = true,
+            SkipRegistry = true,
+            DirectoryEnumWorkers = 1,
+            FileReadWorkers = 1,
+            ParserWorkers = 1,
+            ReadBufferBytes = 64 * 1024
+        };
+        options.Keywords.Add("boundary-keyword");
+        options.Roots.Add(scanRoot);
+
+        var payload = await service.RunAsync(options);
+        Assert(payload.Findings.Any(f => f.Kind == "FILE-CONTENT" && f.Location.Equals(file, StringComparison.OrdinalIgnoreCase)),
+            "Byte prefilter should not skip matches that continue across read-buffer boundaries.");
     }
 
     private static async Task RunSmartContentGateScan(string root)
@@ -207,6 +282,43 @@ internal static class Program
             "Smart scan should find keyword content inside ZIP-family archive entries.");
         Assert(FindingCleanupService.CountTargets(payload.Findings) == 1,
             "Archive entry findings should resolve to one cleanup target: the containing archive.");
+    }
+
+    private static async Task RunDeepArchiveCoverageScan(string root)
+    {
+        string scanRoot = Path.Combine(root, "DeepArchiveCoverage");
+        Directory.CreateDirectory(scanRoot);
+        string archivePath = Path.Combine(scanRoot, "many-entries.zip");
+
+        using (var zip = System.IO.Compression.ZipFile.Open(archivePath, System.IO.Compression.ZipArchiveMode.Create))
+        {
+            for (int i = 0; i < 305; i++)
+            {
+                var entry = zip.CreateEntry($"empty/{i:D3}.txt");
+                using var writer = new StreamWriter(entry.Open());
+                if (i == 304)
+                    writer.Write("deep-archive-keyword");
+            }
+        }
+
+        var options = new ScanOptions
+        {
+            SkipElevation = true,
+            SkipRegistry = true,
+            DeepContentScan = true,
+            DirectoryEnumWorkers = 1,
+            FileReadWorkers = 1,
+            ParserWorkers = 1,
+            ReadBufferBytes = 64 * 1024
+        };
+        options.Keywords.Add("deep-archive-keyword");
+        options.Roots.Add(scanRoot);
+
+        var payload = await new ScannerService().RunAsync(options);
+        Assert(payload.Findings.Any(f =>
+                f.Kind == "FILE-ARCHIVE-ENTRY-CONTENT" &&
+                f.Location.Equals(archivePath, StringComparison.OrdinalIgnoreCase)),
+            "Deep scan should inspect archive entries beyond the smart-profile entry limit.");
     }
 
     private static async Task RunCleanupDeleteScan(string root)
